@@ -30,13 +30,13 @@ jobs:
         
     - name: Build Windows executable
       run: |
-        pyinstaller --onefile --noconsole --name "nvidia-smi-gui-monitor" --icon=NONE App.py
+        pyinstaller --onefile --noconsole --name "NVIDIA-SMI Monitor" --icon=NONE App.py
         
     - name: Verify executable
       run: |
-        if (Test-Path "dist/nvidia-smi-gui-monitor.exe") {
+        if (Test-Path "dist/NVIDIA-SMI Monitor.exe") {
           Write-Output "✅ Executable built successfully"
-          Get-Item "dist/nvidia-smi-gui-monitor.exe" | Format-List Name, Length, LastWriteTime
+          Get-Item "dist/NVIDIA-SMI Monitor.exe" | Format-List Name, Length, LastWriteTime
         } else {
           Write-Error "❌ Executable not found!"
           exit 1
@@ -45,8 +45,8 @@ jobs:
     - name: Upload Windows artifact
       uses: actions/upload-artifact@v4
       with:
-        name: nvidia-smi-gui-monitor-windows
-        path: dist/nvidia-smi-gui-monitor.exe
+        name: nvidia-smi-monitor-windows
+        path: dist/NVIDIA-SMI Monitor.exe
         retention-days: 30
 
   build-linux:
@@ -73,17 +73,17 @@ jobs:
         
     - name: Build Linux executable
       run: |
-        pyinstaller --onefile --name "nvidia-smi-gui-monitor" App.py
+        pyinstaller --onefile --name "nvidia-smi-monitor" App.py
         
     - name: Make executable
       run: |
-        chmod +x dist/nvidia-smi-gui-monitor
+        chmod +x dist/nvidia-smi-monitor
         
     - name: Verify executable
       run: |
-        if [ -f "dist/nvidia-smi-gui-monitor" ]; then
+        if [ -f "dist/nvidia-smi-monitor" ]; then
           echo "✅ Executable built successfully"
-          ls -la dist/nvidia-smi-gui-monitor
+          ls -la dist/nvidia-smi-monitor
         else
           echo "❌ Executable not found!"
           exit 1
@@ -92,8 +92,8 @@ jobs:
     - name: Upload Linux artifact
       uses: actions/upload-artifact@v4
       with:
-        name: nvidia-smi-gui-monitor-linux
-        path: dist/nvidia-smi-gui-monitor
+        name: nvidia-smi-monitor-linux
+        path: dist/nvidia-smi-monitor
         retention-days: 30
 
   create-release:
@@ -108,13 +108,13 @@ jobs:
     - name: Download Windows artifact
       uses: actions/download-artifact@v4
       with:
-        name: nvidia-smi-gui-monitor-windows
+        name: nvidia-smi-monitor-windows
         path: ./artifacts/windows/
         
     - name: Download Linux artifact
       uses: actions/download-artifact@v4
       with:
-        name: nvidia-smi-gui-monitor-linux
+        name: nvidia-smi-monitor-linux
         path: ./artifacts/linux/
         
     - name: Get version from tag
@@ -131,8 +131,8 @@ jobs:
         
         ### 📥 Downloads
         
-        - **Windows Users**: Download `nvidia-smi-gui-monitor.exe` - No Python installation required!
-        - **Linux Users**: Download `nvidia-smi-gui-monitor` - Make executable with `chmod +x` before running
+        - **Windows Users**: Download `NVIDIA-SMI Monitor.exe` - No Python installation required!
+        - **Linux Users**: Download `nvidia-smi-monitor` - Make executable with `chmod +x` before running
         
         ### ✨ Features
         
@@ -162,19 +162,19 @@ jobs:
     - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
-        name: "NVIDIA-SMI GUI Monitor ${{ steps.get_version.outputs.VERSION }}"
+        name: "NVIDIA-SMI Monitor ${{ steps.get_version.outputs.VERSION }}"
         body_path: release_notes.md
         draft: false
         prerelease: false
         files: |
-          ./artifacts/windows/nvidia-smi-gui-monitor.exe
-          ./artifacts/linux/nvidia-smi-gui-monitor
+          ./artifacts/windows/NVIDIA-SMI Monitor.exe
+          ./artifacts/linux/nvidia-smi-monitor
         token: ${{ secrets.GITHUB_TOKEN }}
         
     - name: Upload release assets info
       run: |
         echo "✅ Release created successfully!"
         echo "📦 Assets uploaded:"
-        echo "  - nvidia-smi-gui-monitor.exe (Windows)"
-        echo "  - nvidia-smi-gui-monitor (Linux)"
+        echo "  - NVIDIA-SMI Monitor.exe (Windows)"
+        echo "  - nvidia-smi-monitor (Linux)"
         echo "🔗 Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ steps.get_version.outputs.VERSION }}"
