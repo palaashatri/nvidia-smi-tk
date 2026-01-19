@@ -804,6 +804,14 @@ class GPUMonitorApp:
         style.configure('Separator.TFrame',
                       background=theme['separator'],
                       relief='flat')
+
+        style.configure('Metric.Horizontal.TProgressbar',
+                  background=theme['accent'],
+                  troughcolor=theme['card_bg'],
+                  bordercolor=theme['card_border'],
+                  lightcolor=theme['accent'],
+                  darkcolor=theme['accent'],
+                  thickness=6)
     
     def update_text_widget_colors(self):
         theme = DARK_THEME if self.config['dark_mode'] else LIGHT_THEME
@@ -1080,6 +1088,36 @@ Platform: {platform.system()} {platform.release()}
         for index, (val, k) in enumerate(items):
             self.labels['proc_table'].move(k, '', index)
 
+    def copy_selected_value(self, column_index):
+        selection = self.labels['proc_table'].selection()
+        if not selection:
+            return
+        values = self.labels['proc_table'].item(selection[0], 'values')
+        if column_index >= len(values):
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(str(values[column_index]))
+        self.labels['status'].config(text=f"Copied: {values[column_index]}")
+
+    def end_selected_task(self):
+        selection = self.labels['proc_table'].selection()
+        if not selection:
+            return
+        values = self.labels['proc_table'].item(selection[0], 'values')
+        if len(values) < 2:
+            return
+        pid, name = values[0], values[1]
+        if not messagebox.askyesno("End Task", f"End process {name} (PID {pid})?"):
+            return
+        try:
+            if platform.system() == "Windows":
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=True, capture_output=True)
+            else:
+                os.kill(int(pid), 9)
+            self.labels['status'].config(text=f"Ended process {pid}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not end task: {e}")
+
     def init_gui(self):
         name = get_gpu_info()
         theme = DARK_THEME if self.config['dark_mode'] else LIGHT_THEME
@@ -1103,7 +1141,7 @@ Platform: {platform.system()} {platform.release()}
         
         btn_container = tk.Frame(header_outer, bg=theme['accent'])
         btn_container.pack(side='right', padx=20, pady=15)
-        
+
         power_btn = tk.Button(btn_container, text="Power Settings", 
                               bg="#ffffff", fg=theme['accent'],
                               font=("Segoe UI Semibold", 9),
@@ -1122,6 +1160,37 @@ Platform: {platform.system()} {platform.release()}
         divider = tk.Frame(self.root, bg=theme['header_gradient_end'], height=3)
         divider.pack(fill='x', padx=0, pady=0)
 
+        toolbar = tk.Frame(self.root, bg=theme['bg'], height=40)
+        toolbar.pack(fill='x', padx=0, pady=0)
+        toolbar.pack_propagate(False)
+
+        toolbar_inner = tk.Frame(toolbar, bg=theme['bg'])
+        toolbar_inner.pack(side='left', padx=15, pady=8)
+
+        def make_toolbar_btn(text, cmd, tooltip):
+            btn = tk.Button(
+                toolbar_inner,
+                text=text,
+                bg=theme['card_bg'],
+                fg=theme['accent'],
+                font=("Segoe UI", 8),
+                relief='flat',
+                borderwidth=1,
+                highlightthickness=0,
+                padx=12,
+                pady=4,
+                cursor='hand2',
+                command=cmd
+            )
+            btn.pack(side='left', padx=4)
+            create_tooltip(btn, tooltip)
+            return btn
+
+        make_toolbar_btn("Refresh", self.manual_refresh, "Refresh now (F5)")
+        if MATPLOTLIB_AVAILABLE:
+            make_toolbar_btn("Graphs", self.show_graphs, "Open graphs (Ctrl+G)")
+        make_toolbar_btn("Theme", self.toggle_theme, "Toggle light/dark (Ctrl+D)")
+
         metrics_container = ttk.Frame(self.root)
         metrics_container.pack(padx=20, pady=(15, 10), fill="x")
         
@@ -1134,6 +1203,7 @@ Platform: {platform.system()} {platform.release()}
             ('temp', 'Temperature', 'GPU core temperature in Celsius'),
             ('power', 'Power Draw', 'Current power consumption vs limit')
         ]
+        metric_max = {'util': 100, 'mem': 100, 'temp': 100, 'power': 120}
         
         for i, (key, title, tooltip) in enumerate(metrics):
             card = ttk.Frame(row_container, style='Card.TFrame')
@@ -1148,6 +1218,10 @@ Platform: {platform.system()} {platform.release()}
             
             self.labels[key] = ttk.Label(inner, text="--", style='Value.TLabel')
             self.labels[key].pack(anchor='w', pady=(4, 0))
+
+            bar = ttk.Progressbar(inner, style='Metric.Horizontal.TProgressbar', mode='determinate', maximum=metric_max.get(key, 100))
+            bar.pack(fill='x', pady=(6, 0))
+            self.labels[f"{key}_bar"] = bar
         
         row_container2 = ttk.Frame(metrics_container)
         row_container2.pack(fill="x", pady=(10, 0))
@@ -1192,11 +1266,48 @@ Platform: {platform.system()} {platform.release()}
         self.labels['proc_table'].column("PID", width=100, anchor="center")
         self.labels['proc_table'].column("Name", width=350, anchor="w")
         self.labels['proc_table'].column("Memory", width=130, anchor="center")
+        # Tag styles for striping/hover
+        theme = DARK_THEME if self.config['dark_mode'] else LIGHT_THEME
+        self.labels['proc_table'].tag_configure('even', background=theme['tree_bg'])
+        self.labels['proc_table'].tag_configure('odd', background=theme['tree_alt_bg'])
+        self.labels['proc_table'].tag_configure('hover', background=theme['hover_bg'])
+        self.hover_row = None
+        self.proc_context = Menu(proc_frame, tearoff=0)
+        self.proc_context.add_command(label="Copy PID", command=lambda: self.copy_selected_value(0))
+        self.proc_context.add_command(label="Copy Name", command=lambda: self.copy_selected_value(1))
+        self.proc_context.add_separator()
+        self.proc_context.add_command(label="End Task", command=self.end_selected_task)
         
         scrollbar = ttk.Scrollbar(proc_frame, orient="vertical", command=self.labels['proc_table'].yview)
         self.labels['proc_table'].configure(yscrollcommand=scrollbar.set)
         self.labels['proc_table'].pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+
+        def on_motion(event):
+            row = self.labels['proc_table'].identify_row(event.y)
+            if row == self.hover_row:
+                return
+            if self.hover_row:
+                self.labels['proc_table'].item(self.hover_row, tags=[t for t in self.labels['proc_table'].item(self.hover_row, 'tags') if t != 'hover'])
+            self.hover_row = row
+            if row:
+                tags = list(self.labels['proc_table'].item(row, 'tags'))
+                if 'hover' not in tags:
+                    tags.append('hover')
+                self.labels['proc_table'].item(row, tags=tags)
+
+        self.labels['proc_table'].bind('<Motion>', on_motion)
+
+        def show_context(event):
+            row = self.labels['proc_table'].identify_row(event.y)
+            if row:
+                self.labels['proc_table'].selection_set(row)
+            try:
+                self.proc_context.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.proc_context.grab_release()
+
+        self.labels['proc_table'].bind('<Button-3>', show_context)
 
         def toggle_full_output():
             if self.labels['full_output_frame'].winfo_ismapped():
@@ -1297,20 +1408,29 @@ Platform: {platform.system()} {platform.release()}
         util_val = metrics.get("utilization", 0)
         util_color = color_for_percent(util_val)
         self.labels['util'].config(text=f"{util_val:.1f}%", foreground=util_color)
+        if 'util_bar' in self.labels:
+            self.labels['util_bar']['value'] = max(0, min(100, util_val))
 
         mem_str, mem_percent = format_memory(mem_used, mem_total)
         mem_color = color_for_percent(mem_percent)
         self.labels['mem'].config(text=mem_str, foreground=mem_color)
+        if 'mem_bar' in self.labels:
+            self.labels['mem_bar']['value'] = max(0, min(100, mem_percent))
 
         temp = metrics.get("temperature", 0)
         temp_color = color_for_temp(temp)
         self.labels['temp'].config(text=f"{temp}°C", foreground=temp_color)
+        if 'temp_bar' in self.labels:
+            self.labels['temp_bar']['value'] = max(0, min(100, temp))
 
         power_draw = metrics.get("power_draw", 0)
         power_limit = metrics.get("power_limit", 1)
         power_color = color_for_power(power_draw, power_limit)
         power_str = f"{power_draw:.1f} W / {power_limit:.1f} W"
         self.labels['power'].config(text=power_str, foreground=power_color)
+        if 'power_bar' in self.labels:
+            pct = (power_draw / power_limit * 100) if power_limit else 0
+            self.labels['power_bar']['value'] = max(0, min(120, pct))
         
         fan_speed = metrics.get("fan_speed")
         if fan_speed is not None:
@@ -1325,8 +1445,13 @@ Platform: {platform.system()} {platform.release()}
         self.labels['clock_mem'].config(text=f"{clock_mem:.0f} MHz", foreground="purple")
 
         self.labels['proc_table'].delete(*self.labels['proc_table'].get_children())
-        for proc in processes:
-            self.labels['proc_table'].insert("", "end", values=(proc["pid"], proc["name"], proc["mem"]))
+        theme = DARK_THEME if self.config['dark_mode'] else LIGHT_THEME
+        self.labels['proc_table'].tag_configure('even', background=theme['tree_bg'], foreground=theme['tree_fg'])
+        self.labels['proc_table'].tag_configure('odd', background=theme['tree_alt_bg'], foreground=theme['tree_fg'])
+        self.labels['proc_table'].tag_configure('hover', background=theme['hover_bg'], foreground=theme['fg'])
+        for idx, proc in enumerate(processes):
+            tag = 'even' if idx % 2 == 0 else 'odd'
+            self.labels['proc_table'].insert("", "end", values=(proc["pid"], proc["name"], proc["mem"]), tags=(tag,))
 
         self.labels['full_output_text'].config(state="normal")
         self.labels['full_output_text'].delete("1.0", tk.END)
