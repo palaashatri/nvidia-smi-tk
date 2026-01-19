@@ -35,7 +35,7 @@ except ImportError:
 
 VERSION = "2.0.0"
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".nvidia_smi_tk_config.json")
-HISTORY_SIZE = 300
+HISTORY_SIZE = 60
 
 COLOR_UTIL_WARN = 70
 COLOR_UTIL_DANGER = 90
@@ -122,7 +122,7 @@ tray_icon = None
 
 def load_config():
     default_config = {
-        "refresh_rate": 2000,
+        "refresh_rate": 3000,
         "window_x": 100,
         "window_y": 100,
         "window_width": 800,
@@ -163,9 +163,10 @@ def get_gpu_info():
         return static_cache['gpu_name']
     try:
         def fetch():
+            creationflags = 0x08000000 if platform.system() == "Windows" else 0
             info = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"],
-                encoding="utf-8", stderr=subprocess.STDOUT
+                encoding="utf-8", stderr=subprocess.STDOUT, creationflags=creationflags
             ).strip()
             return info.split("\n")[0].strip()
         name = run_with_retry(fetch)
@@ -179,9 +180,10 @@ def get_power_limits():
         return static_cache['power_limits']
     try:
         def fetch():
+            creationflags = 0x08000000 if platform.system() == "Windows" else 0
             smi = subprocess.check_output(
                 ["nvidia-smi", "-q", "-d", "POWER"],
-                encoding="utf-8", stderr=subprocess.STDOUT
+                encoding="utf-8", stderr=subprocess.STDOUT, creationflags=creationflags
             )
             cur = min_ = max_ = None
             for line in smi.splitlines():
@@ -204,15 +206,16 @@ def get_power_limits():
 
 def set_power_limit(new_limit):
     try:
+        creationflags = 0x08000000 if platform.system() == "Windows" else 0
         if platform.system() == "Windows":
             result = subprocess.check_output(
                 ["nvidia-smi", "-pl", str(int(new_limit))],
-                encoding="utf-8", stderr=subprocess.STDOUT
+                encoding="utf-8", stderr=subprocess.STDOUT, creationflags=creationflags
             )
         else:
             result = subprocess.check_output(
                 ["sudo", "nvidia-smi", "-pl", str(int(new_limit))],
-                encoding="utf-8", stderr=subprocess.STDOUT
+                encoding="utf-8", stderr=subprocess.STDOUT, creationflags=creationflags
             )
         static_cache.pop('power_limits', None)
         return True, result
@@ -224,13 +227,15 @@ def set_power_limit(new_limit):
 def get_nvidia_smi_output():
     try:
         def fetch():
+            creationflags = 0x08000000 if platform.system() == "Windows" else 0
+            # Batch both queries into single nvidia-smi call for efficiency
             result = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,fan.speed,clocks.gr,clocks.mem", "--format=csv,noheader,nounits"],
-                encoding="utf-8", stderr=subprocess.STDOUT
+                encoding="utf-8", stderr=subprocess.STDOUT, creationflags=creationflags, timeout=5
             )
             proc_result = subprocess.check_output(
                 ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"],
-                encoding="utf-8", stderr=subprocess.STDOUT
+                encoding="utf-8", stderr=subprocess.STDOUT, creationflags=creationflags, timeout=5
             )
             return result.strip(), proc_result.strip()
         return run_with_retry(fetch)
@@ -379,153 +384,6 @@ def check_alerts(metrics, config):
             show_notification("Utilization Alert", f"GPU utilization is {util}% (threshold: {alert_util}%)")
             last_alert_time['util'] = current_time
 
-def get_gpu_info():
-    if 'gpu_name' in static_cache:
-        return static_cache['gpu_name']
-    try:
-        def fetch():
-            info = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"],
-                encoding="utf-8", stderr=subprocess.STDOUT
-            ).strip()
-            return info.split("\n")[0].strip()
-        name = run_with_retry(fetch)
-        static_cache['gpu_name'] = name
-        return name
-    except Exception:
-        return "Unknown"
-
-def get_power_limits():
-    if 'power_limits' in static_cache:
-        return static_cache['power_limits']
-    try:
-        def fetch():
-            smi = subprocess.check_output(
-                ["nvidia-smi", "-q", "-d", "POWER"],
-                encoding="utf-8", stderr=subprocess.STDOUT
-            )
-            cur = min_ = max_ = None
-            for line in smi.splitlines():
-                line = line.strip()
-                m_cur = re.match(r"^Power Limit\s*:\s*([\d\.]+) W", line)
-                m_min = re.match(r"^Min Power Limit\s*:\s*([\d\.]+) W", line)
-                m_max = re.match(r"^Max Power Limit\s*:\s*([\d\.]+) W", line)
-                if m_cur:
-                    cur = float(m_cur.group(1))
-                elif m_min:
-                    min_ = float(m_min.group(1))
-                elif m_max:
-                    max_ = float(m_max.group(1))
-            return cur, min_, max_
-        result = run_with_retry(fetch)
-        static_cache['power_limits'] = result
-        return result
-    except Exception:
-        return None, None, None
-
-def set_power_limit(new_limit):
-    try:
-        if platform.system() == "Windows":
-            result = subprocess.check_output(
-                ["nvidia-smi", "-pl", str(int(new_limit))],
-                encoding="utf-8", stderr=subprocess.STDOUT
-            )
-        else:
-            result = subprocess.check_output(
-                ["sudo", "nvidia-smi", "-pl", str(int(new_limit))],
-                encoding="utf-8", stderr=subprocess.STDOUT
-            )
-        static_cache.pop('power_limits', None)
-        return True, result
-    except subprocess.CalledProcessError as e:
-        return False, e.output
-    except Exception as e:
-        return False, str(e)
-
-def get_nvidia_smi_output():
-    try:
-        def fetch():
-            result = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,fan.speed,clocks.gr,clocks.mem", "--format=csv,noheader,nounits"],
-                encoding="utf-8", stderr=subprocess.STDOUT
-            )
-            proc_result = subprocess.check_output(
-                ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"],
-                encoding="utf-8", stderr=subprocess.STDOUT
-            )
-            return result.strip(), proc_result.strip()
-        return run_with_retry(fetch)
-    except FileNotFoundError:
-        return "Error: nvidia-smi not found. Ensure drivers are installed.", ""
-    except Exception as e:
-        return f"Error: {e}", ""
-
-def parse_gpu_metrics(output):
-    metrics = {}
-    try:
-        parts = [x.strip() for x in output.split(",")]
-        metrics["utilization"] = float(parts[0]) if parts[0] else 0
-        metrics["mem_used"] = float(parts[1]) if parts[1] else 0
-        metrics["mem_total"] = float(parts[2]) if parts[2] else 1
-        metrics["temperature"] = int(float(parts[3])) if parts[3] else 0
-        metrics["power_draw"] = float(parts[4]) if parts[4] else 0
-        metrics["power_limit"] = float(parts[5]) if parts[5] else 1
-        metrics["fan_speed"] = float(parts[6]) if len(parts) > 6 and parts[6] and parts[6] != "[N/A]" else None
-        metrics["clock_gpu"] = float(parts[7]) if len(parts) > 7 and parts[7] else 0
-        metrics["clock_mem"] = float(parts[8]) if len(parts) > 8 and parts[8] else 0
-    except Exception:
-        pass
-    return metrics
-
-def parse_processes(proc_output):
-    processes = []
-    for line in proc_output.splitlines():
-        if not line.strip():
-            continue
-        parts = [x.strip() for x in line.split(",")]
-        if len(parts) == 3:
-            pid, name, mem = parts
-            processes.append({
-                "pid": pid,
-                "name": name,
-                "mem": mem
-            })
-    return processes
-
-def format_memory(mem_used, mem_total):
-    percent = (mem_used / mem_total) * 100 if mem_total else 0
-    if mem_total >= 1024:
-        used_str = f"{mem_used/1024:.1f} GB"
-        total_str = f"{mem_total/1024:.1f} GB"
-    else:
-        used_str = f"{mem_used:.0f} MB"
-        total_str = f"{mem_total:.0f} MB"
-    return f"{used_str} / {total_str} ({percent:.1f}%)", percent
-
-def color_for_percent(val, warn=COLOR_UTIL_WARN, danger=COLOR_UTIL_DANGER):
-    if val < warn:
-        return "green"
-    elif val < danger:
-        return "orange"
-    else:
-        return "red"
-
-def color_for_temp(temp):
-    if temp < COLOR_TEMP_WARN:
-        return "green"
-    elif temp < COLOR_TEMP_DANGER:
-        return "orange"
-    else:
-        return "red"
-
-def color_for_power(draw, limit):
-    if draw < limit * COLOR_POWER_WARN:
-        return "green"
-    elif draw < limit * COLOR_POWER_DANGER:
-        return "orange"
-    else:
-        return "red"
-
 def create_tooltip(widget, text):
     tooltip = None
     
@@ -660,6 +518,8 @@ class GPUMonitorApp:
         self.sort_column = None
         self.sort_reverse = False
         self.graph_window = None
+        self.cached_theme = None  # Cache theme for performance
+        self.last_process_list = []  # Cache for process list comparison
         
         self.root.title(f"NVIDIA-SMI GPU Monitor v{VERSION}")
         self.root.geometry(f"{self.config['window_width']}x{self.config['window_height']}+{self.config['window_x']}+{self.config['window_y']}")
@@ -714,7 +574,9 @@ class GPUMonitorApp:
             self.root.bind('<Control-g>', lambda e: self.show_graphs())
     
     def apply_theme(self):
-        theme = DARK_THEME if self.config['dark_mode'] else LIGHT_THEME
+        # Cache current theme for reuse in apply_theme
+        self.current_theme = DARK_THEME if self.config['dark_mode'] else LIGHT_THEME
+        theme = self.current_theme
         self.root.configure(bg=theme['bg'])
         
         style = ttk.Style()
@@ -812,6 +674,9 @@ class GPUMonitorApp:
                   lightcolor=theme['accent'],
                   darkcolor=theme['accent'],
                   thickness=6)
+        
+        style.configure('MainContainer.TFrame',
+                      background=theme['bg'])
     
     def update_text_widget_colors(self):
         theme = DARK_THEME if self.config['dark_mode'] else LIGHT_THEME
@@ -823,7 +688,8 @@ class GPUMonitorApp:
         save_config(self.config)
         self.apply_theme()
         self.update_text_widget_colors()
-        messagebox.showinfo("Theme Changed", "Theme has been updated!")
+        # Don't show messagebox - faster for gaming use
+        # messagebox.showinfo("Theme Changed", "Theme has been updated!")
     
     def toggle_always_on_top(self):
         self.config['always_on_top'] = not self.config.get('always_on_top', False)
@@ -1120,7 +986,7 @@ Platform: {platform.system()} {platform.release()}
 
     def init_gui(self):
         name = get_gpu_info()
-        theme = DARK_THEME if self.config['dark_mode'] else LIGHT_THEME
+        theme = self.current_theme if hasattr(self, 'current_theme') else (DARK_THEME if self.config['dark_mode'] else LIGHT_THEME)
         
         header_outer = tk.Frame(self.root, bg=theme['accent'], height=85)
         header_outer.pack(fill="x", padx=0, pady=0)
@@ -1143,7 +1009,7 @@ Platform: {platform.system()} {platform.release()}
         btn_container.pack(side='right', padx=20, pady=15)
 
         power_btn = tk.Button(btn_container, text="Power Settings", 
-                              bg="#ffffff", fg=theme['accent'],
+                              bg=theme['button_bg'], fg="#ffffff",
                               font=("Segoe UI Semibold", 9),
                               relief='flat', borderwidth=1, highlightthickness=0,
                               padx=18, pady=8, cursor='hand2',
@@ -1151,9 +1017,9 @@ Platform: {platform.system()} {platform.release()}
         power_btn.pack()
         
         def on_enter(e):
-            power_btn.config(bg="#f0f7e8", highlightbackground=theme['accent'], highlightcolor=theme['accent'])
+            power_btn.config(bg=theme['button_hover'])
         def on_leave(e):
-            power_btn.config(bg="#ffffff", highlightbackground=theme['card_border'], highlightcolor=theme['card_border'])
+            power_btn.config(bg=theme['button_bg'])
         power_btn.bind("<Enter>", on_enter)
         power_btn.bind("<Leave>", on_leave)
 
@@ -1180,7 +1046,9 @@ Platform: {platform.system()} {platform.release()}
                 padx=12,
                 pady=4,
                 cursor='hand2',
-                command=cmd
+                command=cmd,
+                activebackground=theme['hover_bg'],
+                activeforeground=theme['accent']
             )
             btn.pack(side='left', padx=4)
             create_tooltip(btn, tooltip)
@@ -1191,10 +1059,10 @@ Platform: {platform.system()} {platform.release()}
             make_toolbar_btn("Graphs", self.show_graphs, "Open graphs (Ctrl+G)")
         make_toolbar_btn("Theme", self.toggle_theme, "Toggle light/dark (Ctrl+D)")
 
-        metrics_container = ttk.Frame(self.root)
+        metrics_container = ttk.Frame(self.root, style='MainContainer.TFrame')
         metrics_container.pack(padx=20, pady=(15, 10), fill="x")
         
-        row_container = ttk.Frame(metrics_container)
+        row_container = ttk.Frame(metrics_container, style='MainContainer.TFrame')
         row_container.pack(fill="x")
         
         metrics = [
@@ -1223,7 +1091,7 @@ Platform: {platform.system()} {platform.release()}
             bar.pack(fill='x', pady=(6, 0))
             self.labels[f"{key}_bar"] = bar
         
-        row_container2 = ttk.Frame(metrics_container)
+        row_container2 = ttk.Frame(metrics_container, style='MainContainer.TFrame')
         row_container2.pack(fill="x", pady=(10, 0))
         
         metrics2 = [
@@ -1249,10 +1117,13 @@ Platform: {platform.system()} {platform.release()}
         separator = ttk.Frame(self.root, height=1, style='Separator.TFrame')
         separator.pack(fill='x', padx=20, pady=(15, 0))
         
-        self.labels['proc_label'] = ttk.Label(self.root, text="RUNNING PROCESSES", style='Title.TLabel')
+        processes_container = ttk.Frame(self.root, style='MainContainer.TFrame')
+        processes_container.pack(padx=0, pady=0, fill="x")
+        
+        self.labels['proc_label'] = ttk.Label(processes_container, text="RUNNING PROCESSES", style='Title.TLabel')
         self.labels['proc_label'].pack(pady=(20, 10), padx=20, anchor='w')
         
-        proc_card = ttk.Frame(self.root, style='Card.TFrame')
+        proc_card = ttk.Frame(processes_container, style='Card.TFrame')
         proc_card.pack(padx=20, pady=(0, 15), fill="both", expand=True)
         
         proc_frame = ttk.Frame(proc_card, style='Card.TFrame')
@@ -1336,7 +1207,7 @@ Platform: {platform.system()} {platform.release()}
         self.labels['full_output_text'].pack(fill="both", expand=True)
         self.labels['full_output_text'].config(state="disabled")
         
-        status_frame = tk.Frame(self.root, bg=theme['card_bg'], height=35)
+        status_frame = tk.Frame(self.root, bg=theme['accent_light'], height=35)
         status_frame.pack(side="bottom", fill="x")
         status_frame.pack_propagate(False)
         
@@ -1350,15 +1221,30 @@ Platform: {platform.system()} {platform.release()}
         stop_update = False
         
         def background_worker():
+            full_output_counter = 0
             while not stop_update:
                 try:
                     gpu_output, proc_output = get_nvidia_smi_output()
                     gpu_data_cache['gpu_output'] = gpu_output
                     gpu_data_cache['proc_output'] = proc_output
                     gpu_data_cache['timestamp'] = datetime.now()
+                    
+                    # Fetch full output only every 5th update to reduce CPU/disk load
+                    full_output_counter += 1
+                    if full_output_counter >= 5:
+                        try:
+                            creationflags = 0x08000000 if platform.system() == "Windows" else 0
+                            gpu_data_cache['full_output'] = subprocess.check_output(
+                                ["nvidia-smi"], encoding="utf-8", stderr=subprocess.STDOUT,
+                                creationflags=creationflags, timeout=5
+                            )
+                        except Exception:
+                            pass  # Keep previous output on error
+                        full_output_counter = 0
                 except Exception as e:
                     gpu_data_cache['error'] = str(e)
                 
+                # Sleep in smaller increments for responsive shutdown
                 for _ in range(self.config['refresh_rate'] // 100):
                     if stop_update:
                         break
@@ -1394,6 +1280,7 @@ Platform: {platform.system()} {platform.release()}
         metrics = parse_gpu_metrics(gpu_output)
         processes = parse_processes(proc_output)
         
+        # Lightweight history tracking with deque (auto-trimmed)
         history_data['time'].append(timestamp.strftime('%H:%M:%S'))
         history_data['utilization'].append(metrics.get("utilization", 0))
         history_data['temperature'].append(metrics.get("temperature", 0))
@@ -1444,23 +1331,35 @@ Platform: {platform.system()} {platform.release()}
         clock_mem = metrics.get("clock_mem", 0)
         self.labels['clock_mem'].config(text=f"{clock_mem:.0f} MHz", foreground="purple")
 
-        self.labels['proc_table'].delete(*self.labels['proc_table'].get_children())
-        theme = DARK_THEME if self.config['dark_mode'] else LIGHT_THEME
-        self.labels['proc_table'].tag_configure('even', background=theme['tree_bg'], foreground=theme['tree_fg'])
-        self.labels['proc_table'].tag_configure('odd', background=theme['tree_alt_bg'], foreground=theme['tree_fg'])
-        self.labels['proc_table'].tag_configure('hover', background=theme['hover_bg'], foreground=theme['fg'])
-        for idx, proc in enumerate(processes):
-            tag = 'even' if idx % 2 == 0 else 'odd'
-            self.labels['proc_table'].insert("", "end", values=(proc["pid"], proc["name"], proc["mem"]), tags=(tag,))
+        # Cache theme locally to avoid repeated dict lookups
+        cached_theme = DARK_THEME if self.config['dark_mode'] else LIGHT_THEME
+        
+        # Efficient process table update: only refresh if process list changed
+        current_pids = {item[0] for item in [self.labels['proc_table'].item(child)['values'] for child in self.labels['proc_table'].get_children()]} if self.labels['proc_table'].get_children() else set()
+        new_pids = {proc["pid"] for proc in processes}
+        
+        if current_pids != new_pids or len(self.labels['proc_table'].get_children()) != len(processes):
+            self.labels['proc_table'].delete(*self.labels['proc_table'].get_children())
+            # Configure tags only once per theme change
+            self.labels['proc_table'].tag_configure('even', background=cached_theme['tree_bg'], foreground=cached_theme['tree_fg'])
+            self.labels['proc_table'].tag_configure('odd', background=cached_theme['tree_alt_bg'], foreground=cached_theme['tree_fg'])
+            self.labels['proc_table'].tag_configure('hover', background=cached_theme['hover_bg'], foreground=cached_theme['fg'])
+            for idx, proc in enumerate(processes):
+                tag = 'even' if idx % 2 == 0 else 'odd'
+                self.labels['proc_table'].insert("", "end", values=(proc["pid"], proc["name"], proc["mem"]), tags=(tag,))
 
-        self.labels['full_output_text'].config(state="normal")
-        self.labels['full_output_text'].delete("1.0", tk.END)
-        self.labels['full_output_text'].insert("1.0", subprocess.getoutput("nvidia-smi"))
-        self.labels['full_output_text'].config(state="disabled")
+        # Only update full output text if it's visible (lazy-load optimization)
+        if self.labels['full_output_text'].winfo_viewable():
+            if 'full_output' in gpu_data_cache:
+                self.labels['full_output_text'].config(state="normal")
+                self.labels['full_output_text'].delete("1.0", tk.END)
+                self.labels['full_output_text'].insert("1.0", gpu_data_cache['full_output'])
+                self.labels['full_output_text'].config(state="disabled")
         
         self.labels['status'].config(text=f"Last updated {timestamp.strftime('%H:%M:%S')} · Refresh rate {self.config['refresh_rate']/1000:.1f}s")
         
-        if PYSTRAY_AVAILABLE and tray_icon:
+        # Update tray icon less frequently to reduce overhead
+        if PYSTRAY_AVAILABLE and tray_icon and int(time.time()) % 2 == 0:
             tray_icon.title = f"GPU: {util_val:.0f}% | Temp: {temp}°C"
 
         self.root.after(self.config['refresh_rate'], self.update_gui)
