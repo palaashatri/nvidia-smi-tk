@@ -3,24 +3,31 @@
 # Core Python standard library modules (included with Python)
 # - tkinter (GUI framework)
 # - subprocess (for running nvidia-smi command)
-# - threading (for potential future async features)
+# - threading (for async background updates)
 # - time (for timing operations)
+# - json (for configuration storage)
+# - datetime (for timestamps)
+# - collections (for deque data structure)
 
-# No external dependencies required!
-# This application uses only Python standard library modules.
+# Optional dependencies for enhanced features:
+matplotlib>=3.3.0        # For historical graphs (optional)
+pillow>=8.0.0           # For system tray icon (optional)
+pystray>=0.17.0         # For system tray functionality (optional)
+plyer>=2.0.0            # For desktop notifications (optional)
 
 # System Requirements:
 # - Python 3.6 or higher
 # - NVIDIA GPU with compatible drivers
 # - nvidia-smi utility (included with NVIDIA drivers)
 
-# Optional development dependencies (not required for running):
-# pytest>=6.0.0        # For unit testing (future development)
-# black>=21.0.0         # Code formatting (development)
-# flake8>=3.8.0         # Code linting (development)
-
 # Platform-specific notes:
 # Linux (Ubuntu/Debian): sudo apt-get install python3-tk
 # Linux (CentOS/RHEL):   sudo yum install tkinter  
 # macOS:                 Usually included with Python
 # Windows:               Usually included with Python
+
+# Install all optional dependencies:
+# pip install -r requirements.txt
+
+# Install only core (no optional features):
+# No pip install needed - uses only Python standard library
