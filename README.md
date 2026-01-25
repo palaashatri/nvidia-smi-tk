@@ -3,7 +3,8 @@
 A real-time graphical interface for monitoring NVIDIA GPU status using `nvidia-smi`, with color-coded metrics, process table, and power limit adjustment.
 Now with DARK MODE!
 
-<img width="3438" height="1392" alt="image" src="https://github.com/user-attachments/assets/80b9f4c9-411f-4fe7-a8e8-8e961a2b705c" />
+<img width="1769" height="1099" alt="image" src="https://github.com/user-attachments/assets/28221887-f2b2-4dd8-a11e-d759bbab4773" />
+
 
 
 ## Overview
