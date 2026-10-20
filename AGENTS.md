@@ -26,7 +26,7 @@ CI (`.github/workflows/test-build.yml`, `build-release.yml`) only checks that Py
 - **Multi-GPU is broken.** `parse_gpu_metrics` splits the whole CSV output on commas, so with two GPUs the lines run together and values are misread. Parse line by line and show one card per GPU (index from `--query-gpu=index,...`).
 - Values like `[N/A]` or `[Not Supported]` (common for fan or power on laptops) make `float()` fail and the whole update is dropped; parse each field defensively and show "N/A".
 - `sudo nvidia-smi -pl` from a GUI has no terminal for the password prompt, so it fails or hangs. Use `pkexec` (polkit) on Linux, or tell the user to run the app with the required rights; on Windows it needs an elevated process.
-- README says "cross-platform … macOS". Current macOS has no NVIDIA driver or `nvidia-smi`; describe the app as Windows and Linux.
+- macOS is not supported (no NVIDIA driver or `nvidia-smi` on current Macs); the README said otherwise until 2026-10-20.
 - Five unused `except ... as e` variables (ruff F841).
 
 ## Rules
@@ -39,4 +39,4 @@ CI (`.github/workflows/test-build.yml`, `build-release.yml`) only checks that Py
 
 ## Git workflow
 
-Never push to `main`; branch, run the app on a machine with an NVIDIA GPU if you touched queries or parsing, and say in the PR which GPU/driver/OS you tested.
+Branch and open a PR unless the owner asks for a direct push to `main`; run the app on a machine with an NVIDIA GPU if you touched queries or parsing, and say in the PR which GPU/driver/OS you tested.
