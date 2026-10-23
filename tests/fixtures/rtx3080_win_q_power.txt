@@ -1,0 +1,43 @@
+
+==============NVSMI LOG==============
+
+Timestamp                                              : Sat Oct 24 01:20:30 2026
+Driver Version                                         : 621.01 [Deprecated; will be removed in CUDA 14.0. Use KMD Version instead]
+CUDA Version                                           : 13.5 [Deprecated; will be removed in CUDA 14.0. Use CUDA UMD Version instead]
+KMD Version                                            : 621.01
+CUDA UMD Version                                       : 13.5
+
+Attached GPUs                                          : 1
+GPU 00000000:01:00.0
+    GPU Power Readings
+        Average Power Draw                             : 35.52 W
+        Instantaneous Power Draw                       : 35.82 W
+        GPU Ceiling Power Limit
+            Current Power Limit                        : 100.00 W
+            Requested Power Limit                      : 100.00 W
+            Default Power Limit                        : 320.00 W
+        GPU Base Power
+            Current Base Power                         : N/A
+            Requested Base Power                       : N/A
+            Default Base Power                         : N/A
+        Min Power Limit                                : 100.00 W
+        Max Power Limit                                : 370.00 W
+    Power Samples
+        Duration                                       : 2.30 sec
+        Number of Samples                              : 119
+        Max                                            : 38.61 W
+        Min                                            : 33.87 W
+        Avg                                            : 35.34 W
+    GPU Memory Power Readings 
+        Average Power Draw                             : N/A
+        Instantaneous Power Draw                       : N/A
+    Module Power Readings
+        Average Power Draw                             : N/A
+        Instantaneous Power Draw                       : N/A
+        Current Power Limit                            : N/A
+        Requested Power Limit                          : N/A
+        Default Power Limit                            : N/A
+        Min Power Limit                                : N/A
+        Max Power Limit                                : N/A
+    EDPp Multiplier                                    : N/A
+

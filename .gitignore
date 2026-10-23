@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest
+.pytest_cache/
+
+# PyInstaller / Build artifacts
+build/
+dist/
+*.spec
+
+# User local configuration
+.nvidia_smi_tk_config.json

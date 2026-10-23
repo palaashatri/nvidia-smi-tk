@@ -88,7 +88,7 @@ jobs:
         
     - name: Check Python syntax
       run: |
-        python -m py_compile App.py
+        python -m py_compile App.py config.py nvidia_smi.py
         echo "✅ Python syntax check passed"
         
     - name: Test imports (without nvidia-smi)
@@ -101,8 +101,15 @@ jobs:
             from tkinter import ttk
             import subprocess
             import re
+            import config
+            import nvidia_smi
             print('✅ All required modules can be imported')
         except ImportError as e:
             print(f'❌ Import error: {e}')
             sys.exit(1)
         "
+
+    - name: Run unit tests
+      run: |
+        python -m unittest discover -s tests -p "test_*.py" -v
+        echo "✅ All unit tests passed"
