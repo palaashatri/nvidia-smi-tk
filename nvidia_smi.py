@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import platform
 import re
 import shutil
@@ -15,22 +16,6 @@ COLOR_TEMP_WARN = 65
 COLOR_TEMP_DANGER = 80
 COLOR_POWER_WARN = 0.8
 COLOR_POWER_DANGER = 0.95
-
-
-class GPUList(list):
-    """List of GPU metric dictionaries with dict-like fallback."""
-
-    def get(self, key: str, default: Any = None) -> Any:
-        if self and isinstance(self[0], dict):
-            return self[0].get(key, default)
-        return default
-
-    def __getitem__(self, item: Any) -> Any:
-        if isinstance(item, str):
-            if self and isinstance(self[0], dict):
-                return self[0][item]
-            raise KeyError(item)
-        return super().__getitem__(item)
 
 
 def parse_numeric(val: Any, default: Any = None, is_int: bool = False) -> Any:
@@ -51,35 +36,43 @@ def parse_numeric(val: Any, default: Any = None, is_int: bool = False) -> Any:
         return default
 
 
-def parse_gpu_metrics(output: str) -> GPUList:
+def parse_gpu_metrics(output: str) -> list[dict[str, Any]]:
     """Parse nvidia-smi CSV output into a list of GPU metric dictionaries.
 
-    Handles single and multi-GPU outputs line-by-line.
-    Defensively parses unsupported or N/A values without throwing exceptions.
+    Supports:
+    - 12 columns: index, uuid, name, 9 metrics
+    - 11 columns: index, name, 9 metrics
+    - 9 columns: legacy metrics only (default index 0)
     """
-    gpus = GPUList()
-    if not output or output.startswith("Error"):
+    gpus: list[dict[str, Any]] = []
+    if not output or output.startswith("Error") or "No devices" in output:
         return gpus
 
-    lines = [
-        line.strip() for line in output.strip().splitlines() if line.strip()
-    ]
+    lines = [line.strip() for line in output.strip().splitlines() if line.strip()]
     for i, line in enumerate(lines):
         if line.startswith(("#", "=")):
             continue
         parts = [p.strip() for p in line.split(",")]
-        # Standard query format with index and name has >= 11 columns
-        if len(parts) >= 11:
+        gpu_uuid: str | None = None
+
+        if len(parts) >= 12:
             raw_index = parts[0]
             try:
                 gpu_index = int(raw_index)
             except ValueError:
                 gpu_index = i
-
+            gpu_uuid = parts[1]
+            gpu_name = ", ".join(parts[2:-9]).strip() or f"GPU {gpu_index}"
+            metric_parts = parts[-9:]
+        elif len(parts) >= 11:
+            raw_index = parts[0]
+            try:
+                gpu_index = int(raw_index)
+            except ValueError:
+                gpu_index = i
             gpu_name = ", ".join(parts[1:-9]).strip() or f"GPU {gpu_index}"
             metric_parts = parts[-9:]
         elif len(parts) >= 9:
-            # Fallback for legacy 9-column queries without index/name
             gpu_index = i
             gpu_name = f"GPU {gpu_index}"
             metric_parts = parts[-9:]
@@ -88,6 +81,7 @@ def parse_gpu_metrics(output: str) -> GPUList:
 
         gpu_dict = {
             "index": gpu_index,
+            "uuid": gpu_uuid,
             "name": gpu_name,
             "utilization": parse_numeric(metric_parts[0]),
             "mem_used": parse_numeric(metric_parts[1]),
@@ -104,34 +98,51 @@ def parse_gpu_metrics(output: str) -> GPUList:
     return gpus
 
 
-def parse_processes(proc_output: str) -> list[dict[str, str]]:
-    """Parse nvidia-smi compute-apps CSV output into a list of process dicts."""
+def parse_processes(
+    proc_output: str, uuid_to_index: dict[str, int] | None = None
+) -> list[dict[str, str]]:
+    """Parse nvidia-smi compute-apps CSV output into a list of process dicts.
+
+    Maps GPU UUIDs to numerical GPU indices when uuid_to_index is provided.
+    """
     processes = []
     if not proc_output or proc_output.startswith("Error"):
         return processes
 
-    for line in proc_output.splitlines():
-        line = line.strip()
+    for raw_line in proc_output.splitlines():
+        line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         parts = [x.strip() for x in line.split(",")]
         if len(parts) >= 4:
-            # gpu_index, pid, name, mem
-            gpu_idx, pid, name, mem = parts[0], parts[1], parts[2], parts[3]
-            processes.append({
-                "gpu": gpu_idx,
-                "pid": pid,
-                "name": name,
-                "mem": mem if mem and "n/a" not in mem.lower() else "N/A",
-            })
+            # gpu_id (uuid or index), pid, name, mem
+            raw_gpu, pid, name, mem = parts[0], parts[1], parts[2], parts[3]
+            gpu_str = "0"
+            if uuid_to_index and raw_gpu in uuid_to_index:
+                gpu_str = str(uuid_to_index[raw_gpu])
+            elif raw_gpu.isdigit():
+                gpu_str = raw_gpu
+
+            mem_val = mem if mem and "n/a" not in mem.lower() else "N/A"
+            processes.append(
+                {
+                    "gpu": gpu_str,
+                    "pid": pid,
+                    "name": name,
+                    "mem": mem_val,
+                }
+            )
         elif len(parts) == 3:
             pid, name, mem = parts[0], parts[1], parts[2]
-            processes.append({
-                "gpu": "0",
-                "pid": pid,
-                "name": name,
-                "mem": mem if mem and "n/a" not in mem.lower() else "N/A",
-            })
+            mem_val = mem if mem and "n/a" not in mem.lower() else "N/A"
+            processes.append(
+                {
+                    "gpu": "0",
+                    "pid": pid,
+                    "name": name,
+                    "mem": mem_val,
+                }
+            )
 
     return processes
 
@@ -140,7 +151,7 @@ def parse_power_limits(
     smi_output: str, gpu_index: int | None = None
 ) -> tuple[float | None, float | None, float | None]:
     """Parse power limits (current, min, max) from nvidia-smi POWER output."""
-    if not smi_output:
+    if not smi_output or "No devices" in smi_output:
         return None, None, None
 
     cur: float | None = None
@@ -157,18 +168,14 @@ def parse_power_limits(
             target_section = gpu_sections[gpu_index]
 
     cur_pat = re.compile(
-        r"^(?:Current\s+Power\s+Limit|Power\s+Limit)\s*:\s*([\d\.]+)\s*W",
+        r"^(?:Current\s+Power\s+Limit|Power\s+Limit|Enforced\s+Power\s+Limit)\s*:\s*([\d\.]+)\s*W",
         re.IGNORECASE,
     )
-    min_pat = re.compile(
-        r"^Min\s+Power\s+Limit\s*:\s*([\d\.]+)\s*W", re.IGNORECASE
-    )
-    max_pat = re.compile(
-        r"^Max\s+Power\s+Limit\s*:\s*([\d\.]+)\s*W", re.IGNORECASE
-    )
+    min_pat = re.compile(r"^Min\s+Power\s+Limit\s*:\s*([\d\.]+)\s*W", re.IGNORECASE)
+    max_pat = re.compile(r"^Max\s+Power\s+Limit\s*:\s*([\d\.]+)\s*W", re.IGNORECASE)
 
-    for line in target_section.splitlines():
-        line = line.strip()
+    for raw_line in target_section.splitlines():
+        line = raw_line.strip()
         m_cur = cur_pat.match(line)
         m_min = min_pat.match(line)
         m_max = max_pat.match(line)
@@ -204,12 +211,17 @@ def run_with_retry(func, retries=3, delay=0.5):
 
 
 def get_nvidia_smi_output(timeout: int = 5) -> tuple[str, str]:
-    """Query nvidia-smi for GPU metrics and running processes."""
+    """Query nvidia-smi for GPU metrics and running processes.
+
+    Returns:
+        (gpu_output, proc_output) tuple of raw CSV strings.
+    """
     creationflags = 0x08000000 if platform.system() == "Windows" else 0
     try:
+
         def fetch():
             fields = (
-                "index,name,utilization.gpu,memory.used,memory.total,"
+                "index,uuid,name,utilization.gpu,memory.used,memory.total,"
                 "temperature.gpu,power.draw,power.limit,fan.speed,"
                 "clocks.gr,clocks.mem"
             )
@@ -228,7 +240,7 @@ def get_nvidia_smi_output(timeout: int = 5) -> tuple[str, str]:
                 proc_res = subprocess.check_output(
                     [
                         "nvidia-smi",
-                        "--query-compute-apps=pid,process_name,used_memory",
+                        "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
                         "--format=csv,noheader,nounits",
                     ],
                     encoding="utf-8",
@@ -236,7 +248,7 @@ def get_nvidia_smi_output(timeout: int = 5) -> tuple[str, str]:
                     creationflags=creationflags,
                     timeout=timeout,
                 )
-            except Exception:
+            except (subprocess.SubprocessError, OSError):
                 proc_res = ""
             return gpu_res.strip(), proc_res.strip()
 
@@ -248,7 +260,7 @@ def get_nvidia_smi_output(timeout: int = 5) -> tuple[str, str]:
         )
     except subprocess.TimeoutExpired:
         return "Error: nvidia-smi command timed out.", ""
-    except Exception as exc:
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
         return f"Error: {exc}", ""
 
 
@@ -256,6 +268,7 @@ def get_gpu_info(timeout: int = 5) -> str:
     """Fetch GPU model name(s) as a summary string."""
     creationflags = 0x08000000 if platform.system() == "Windows" else 0
     try:
+
         def fetch():
             info = subprocess.check_output(
                 [
@@ -277,10 +290,10 @@ def get_gpu_info(timeout: int = 5) -> str:
                 return "Unknown GPU"
             if len(lines) == 1:
                 return lines[0]
-            return f"{lines[0]} (+{len(lines)-1} more)"
+            return f"{lines[0]} (+{len(lines) - 1} more)"
 
         return run_with_retry(fetch)
-    except Exception:
+    except (subprocess.SubprocessError, OSError, ValueError):
         return "Unknown GPU"
 
 
@@ -290,6 +303,7 @@ def get_power_limits(
     """Retrieve current, minimum, and maximum power limits in Watts."""
     creationflags = 0x08000000 if platform.system() == "Windows" else 0
     try:
+
         def fetch():
             cmd = ["nvidia-smi"]
             if gpu_index is not None:
@@ -305,7 +319,7 @@ def get_power_limits(
             return parse_power_limits(smi, gpu_index=gpu_index)
 
         return run_with_retry(fetch)
-    except Exception:
+    except (subprocess.SubprocessError, OSError, ValueError):
         return None, None, None
 
 
@@ -316,7 +330,7 @@ def set_power_limit(
     max_limit: float | None = None,
     timeout: int = 15,
 ) -> tuple[bool, str]:
-    """Set the GPU power limit with validation and elevation support."""
+    """Set the GPU power limit with range validation and elevation support."""
     if (
         min_limit is not None
         and max_limit is not None
@@ -344,18 +358,30 @@ def set_power_limit(
                 return True, res.stdout.strip()
 
             err_out = (res.stderr or res.stdout).strip()
-            if (
-                "permission" in err_out.lower()
-                or "administrator" in err_out.lower()
-            ):
+            # If standard run fails due to permissions, trigger Windows UAC elevation
+            if "permission" in err_out.lower() or "administrator" in err_out.lower():
+                if hasattr(ctypes, "windll") and hasattr(ctypes.windll, "shell32"):
+                    params = f"-i {gpu_index} -pl {val_str}"
+                    ret = ctypes.windll.shell32.ShellExecuteW(
+                        None, "runas", "nvidia-smi", params, None, 0
+                    )
+                    if ret > 32:
+                        return (
+                            True,
+                            "Elevation prompt requested. Power limit update submitted.",
+                        )
+                    return (
+                        False,
+                        "Administrator elevation was declined or failed.",
+                    )
                 return False, f"Administrator privileges required. {err_out}"
             return False, err_out or "Failed to set power limit."
         except subprocess.TimeoutExpired:
             return False, "nvidia-smi timed out."
-        except Exception as exc:
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
             return False, str(exc)
 
-    # Linux / Unix
+    # Linux / Unix: Check pkexec or fallback to sudo -n
     pkexec_path = shutil.which("pkexec")
     if pkexec_path:
         cmd = [pkexec_path, "nvidia-smi", "-i", str(gpu_index), "-pl", val_str]
@@ -391,13 +417,11 @@ def set_power_limit(
         return False, err_out or "Failed to set power limit."
     except subprocess.TimeoutExpired:
         return False, "Command timed out."
-    except Exception as exc:
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
         return False, str(exc)
 
 
-def format_memory(
-    mem_used: float | None, mem_total: float | None
-) -> tuple[str, float]:
+def format_memory(mem_used: float | None, mem_total: float | None) -> tuple[str, float]:
     """Format memory used / total into human-readable string and percentage."""
     if mem_used is None or mem_total is None or mem_total <= 0:
         return "N/A", 0.0
@@ -411,9 +435,7 @@ def format_memory(
     return f"{used_str} / {total_str} ({percent:.1f}%)", percent
 
 
-def format_power(
-    draw: float | None, limit: float | None
-) -> tuple[str, float]:
+def format_power(draw: float | None, limit: float | None) -> tuple[str, float]:
     """Format power draw / limit into string and percentage."""
     if draw is None and limit is None:
         return "N/A", 0.0

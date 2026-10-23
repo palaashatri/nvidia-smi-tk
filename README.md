@@ -35,11 +35,12 @@ This application provides a user-friendly GUI that displays key NVIDIA GPU infor
 ## Project Structure
 
 ```
-pytk-nvidia-smi-gui/
+nvidia-smi-tk/
 ├── App.py              # Main Tkinter desktop application entrypoint
+├── ui/                 # Modular GUI package (app, dialogs, graphs, theme, tray)
 ├── nvidia_smi.py       # Pure nvidia-smi querying, line-by-line parsing, and CLI handlers
 ├── config.py           # Configuration loading, saving, and defaults
-├── tests/              # Unit & regression tests for parsing, multi-GPU, and mock data
+├── tests/              # Unit & regression tests with real captured fixtures
 ├── docs/screenshots/   # Visual documentation and screenshots
 ├── requirements.txt    # Optional dependencies (core uses Python standard library only)
 ├── LICENSE             # MIT License

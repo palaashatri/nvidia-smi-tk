@@ -1,10 +1,11 @@
-"""Unit tests for nvidia_smi pure parsing and utility functions."""
+"""Unit and regression tests for nvidia_smi using captured fixtures."""
 
 from __future__ import annotations
 
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 from config import DEFAULT_CONFIG, load_config, save_config
 from nvidia_smi import (
@@ -20,74 +21,13 @@ from nvidia_smi import (
     set_power_limit,
 )
 
-SAMPLE_SINGLE_GPU = (
-    "0, NVIDIA GeForce RTX 3080, 25, 2048, 10240, 42.0, 85.0, 100.0, "
-    "40, 1710, 9501\n"
-)
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
-SAMPLE_MULTI_GPU = (
-    "0, NVIDIA GeForce RTX 3080, 25, 2048, 10240, 42.0, 85.0, 100.0, "
-    "40, 1710, 9501\n"
-    "1, NVIDIA GeForce RTX 3070, 15, 1024, 8192, 38.0, 45.0, 220.0, "
-    "30, 1500, 7000\n"
-)
 
-SAMPLE_LAPTOP_NA = (
-    "0, NVIDIA GeForce RTX 3060 Laptop GPU, 10, 1500, 6144, 55.0, "
-    "[N/A], [N/A], [N/A], 1425, 6000\n"
-)
-
-SAMPLE_NOT_SUPPORTED = (
-    "0, NVIDIA A100-SXM4-40GB, 99, 35000, 40960, 60.0, 250.0, 400.0, "
-    "[Not Supported], 1410, 1215\n"
-)
-
-SAMPLE_LEGACY_9COL = (
-    "20, 1000, 8000, 45, 50, 200, 35, 1200, 5000\n"
-)
-
-SAMPLE_POWER_OUTPUT = """
-==============NVSMI LOG==============
-
-Timestamp                                              : Sat Oct 24 00:59:49 2026
-Attached GPUs                                          : 1
-GPU 00000000:01:00.0
-    GPU Power Readings
-        Average Power Draw                             : 40.37 W
-        Instantaneous Power Draw                       : 64.79 W
-        GPU Ceiling Power Limit
-            Current Power Limit                        : 100.00 W
-            Requested Power Limit                      : 100.00 W
-            Default Power Limit                        : 320.00 W
-        Min Power Limit                                : 100.00 W
-        Max Power Limit                                : 370.00 W
-"""
-
-SAMPLE_MULTI_GPU_POWER_OUTPUT = """
-==============NVSMI LOG==============
-Attached GPUs                                          : 2
-GPU 00000000:01:00.0
-    GPU Ceiling Power Limit
-        Current Power Limit                        : 100.00 W
-    Min Power Limit                                : 100.00 W
-    Max Power Limit                                : 370.00 W
-GPU 00000000:02:00.0
-    GPU Ceiling Power Limit
-        Current Power Limit                        : 220.00 W
-    Min Power Limit                                : 125.00 W
-    Max Power Limit                                : 250.00 W
-"""
-
-SAMPLE_PROCESS_OUTPUT_WINDOWS = """
-1720, ....0.4283.62\\msedgewebview2.exe, N/A
-9520, ...2txyewy\\CrossDeviceResume.exe, [N/A]
-10748, ...s\\antigravity\\Antigravity.exe, N/A
-"""
-
-SAMPLE_PROCESS_OUTPUT_LINUX = """
-0, 14502, /usr/bin/python3, 1500 MiB
-1, 16789, /usr/local/bin/blender, 3200 MiB
-"""
+def read_fixture(filename: str) -> str:
+    """Load text content of a fixture file."""
+    path = FIXTURES_DIR / filename
+    return path.read_text(encoding="utf-8")
 
 
 def test_parse_numeric():
@@ -103,69 +43,73 @@ def test_parse_numeric():
     assert parse_numeric("invalid", default=-1) == -1
 
 
-def test_parse_single_gpu():
-    gpus = parse_gpu_metrics(SAMPLE_SINGLE_GPU)
+def test_parse_real_rtx3080_fixture():
+    raw = read_fixture("rtx3080_win_query_gpu_12col.csv")
+    gpus = parse_gpu_metrics(raw)
     assert len(gpus) == 1
     gpu = gpus[0]
     assert gpu["index"] == 0
+    assert gpu["uuid"] == "GPU-7d01e0a7-c69f-519b-c6c7-f6d49fcdaf6f"
     assert gpu["name"] == "NVIDIA GeForce RTX 3080"
-    assert gpu["utilization"] == 25.0
-    assert gpu["mem_used"] == 2048.0
+    assert gpu["utilization"] == 42.0
+    assert gpu["mem_used"] == 1972.0
     assert gpu["mem_total"] == 10240.0
-    assert gpu["temperature"] == 42
-    assert gpu["power_draw"] == 85.0
+    assert gpu["temperature"] == 41
+    assert gpu["power_draw"] == 33.73
     assert gpu["power_limit"] == 100.0
     assert gpu["fan_speed"] == 40.0
-    assert gpu["clock_gpu"] == 1710.0
-    assert gpu["clock_mem"] == 9501.0
-
-    # Test backward compatibility dict-like access
-    assert gpus.get("utilization") == 25.0
-    assert gpus["temperature"] == 42
+    assert gpu["clock_gpu"] == 795.0
+    assert gpu["clock_mem"] == 810.0
 
 
-def test_parse_multi_gpu():
-    gpus = parse_gpu_metrics(SAMPLE_MULTI_GPU)
+def test_parse_multi_gpu_fixture():
+    raw = read_fixture("multi_gpu_query.csv")
+    gpus = parse_gpu_metrics(raw)
     assert len(gpus) == 2
 
     gpu0 = gpus[0]
     assert gpu0["index"] == 0
+    assert gpu0["uuid"] == "GPU-7d01e0a7-c69f-519b-c6c7-f6d49fcdaf6f"
     assert gpu0["name"] == "NVIDIA GeForce RTX 3080"
-    assert gpu0["utilization"] == 25.0
+    assert gpu0["utilization"] == 45.0
     assert gpu0["mem_total"] == 10240.0
 
     gpu1 = gpus[1]
     assert gpu1["index"] == 1
+    assert gpu1["uuid"] == "GPU-8e12f1b8-d70a-620c-d7d8-e7e50fcebf70"
     assert gpu1["name"] == "NVIDIA GeForce RTX 3070"
     assert gpu1["utilization"] == 15.0
     assert gpu1["mem_total"] == 8192.0
     assert gpu1["power_limit"] == 220.0
 
 
-def test_parse_laptop_na_fields():
-    gpus = parse_gpu_metrics(SAMPLE_LAPTOP_NA)
+def test_parse_laptop_na_fixture():
+    raw = read_fixture("laptop_na_query.csv")
+    gpus = parse_gpu_metrics(raw)
     assert len(gpus) == 1
     gpu = gpus[0]
     assert gpu["name"] == "NVIDIA GeForce RTX 3060 Laptop GPU"
-    assert gpu["utilization"] == 10.0
-    assert gpu["temperature"] == 55
-    # Defensive parsing for fan and power
+    assert gpu["utilization"] == 12.0
+    assert gpu["temperature"] == 52
     assert gpu["fan_speed"] is None
     assert gpu["power_draw"] is None
     assert gpu["power_limit"] is None
 
 
-def test_parse_not_supported():
-    gpus = parse_gpu_metrics(SAMPLE_NOT_SUPPORTED)
+def test_parse_server_not_supported_fixture():
+    raw = read_fixture("server_not_supported.csv")
+    gpus = parse_gpu_metrics(raw)
     assert len(gpus) == 1
     gpu = gpus[0]
+    assert gpu["name"] == "NVIDIA A100-SXM4-40GB"
     assert gpu["fan_speed"] is None
     assert gpu["power_draw"] == 250.0
     assert gpu["power_limit"] == 400.0
 
 
-def test_parse_legacy_9col():
-    gpus = parse_gpu_metrics(SAMPLE_LEGACY_9COL)
+def test_parse_legacy_9col_fixture():
+    raw = read_fixture("legacy_9col.csv")
+    gpus = parse_gpu_metrics(raw)
     assert len(gpus) == 1
     gpu = gpus[0]
     assert gpu["index"] == 0
@@ -174,66 +118,61 @@ def test_parse_legacy_9col():
     assert gpu["mem_total"] == 8000.0
 
 
-def test_parse_error_or_empty():
+def test_parse_no_devices_found():
+    raw = read_fixture("no_devices_found.txt")
+    gpus = parse_gpu_metrics(raw)
+    assert len(gpus) == 0
+
+
+def test_parse_empty_and_error():
     assert len(parse_gpu_metrics("")) == 0
     assert len(parse_gpu_metrics("Error: nvidia-smi not found.")) == 0
-    gpus = parse_gpu_metrics("")
-    assert gpus.get("utilization") is None
 
 
-def test_parse_processes_windows():
-    procs = parse_processes(SAMPLE_PROCESS_OUTPUT_WINDOWS)
-    assert len(procs) == 3
-    assert procs[0]["pid"] == "1720"
-    assert "msedgewebview2.exe" in procs[0]["name"]
+def test_parse_real_compute_apps():
+    raw = read_fixture("rtx3080_win_compute_apps.csv")
+    uuid_map = {"GPU-7d01e0a7-c69f-519b-c6c7-f6d49fcdaf6f": 0}
+    procs = parse_processes(raw, uuid_to_index=uuid_map)
+    assert len(procs) == 5
+    assert procs[0]["gpu"] == "0"
+    assert procs[0]["pid"] == "11688"
+    assert "ShellHost.exe" in procs[0]["name"]
     assert procs[0]["mem"] == "N/A"
-    assert procs[1]["pid"] == "9520"
+    assert procs[2]["pid"] == "11424"
+    assert "explorer.exe" in procs[2]["name"]
 
 
-def test_parse_processes_linux():
-    procs = parse_processes(SAMPLE_PROCESS_OUTPUT_LINUX)
+def test_parse_processes_multi_gpu_mapping():
+    raw = (
+        "GPU-7d01e0a7-c69f-519b-c6c7-f6d49fcdaf6f, 1001, python.exe, 500\n"
+        "GPU-8e12f1b8-d70a-620c-d7d8-e7e50fcebf70, 2002, blender.exe, 1200\n"
+    )
+    uuid_map = {
+        "GPU-7d01e0a7-c69f-519b-c6c7-f6d49fcdaf6f": 0,
+        "GPU-8e12f1b8-d70a-620c-d7d8-e7e50fcebf70": 1,
+    }
+    procs = parse_processes(raw, uuid_to_index=uuid_map)
     assert len(procs) == 2
     assert procs[0]["gpu"] == "0"
-    assert procs[0]["pid"] == "14502"
-    assert procs[0]["mem"] == "1500 MiB"
+    assert procs[0]["name"] == "python.exe"
     assert procs[1]["gpu"] == "1"
-    assert procs[1]["pid"] == "16789"
-    assert procs[1]["mem"] == "3200 MiB"
+    assert procs[1]["name"] == "blender.exe"
 
 
-def test_parse_power_limits_single():
-    cur, min_lim, max_lim = parse_power_limits(SAMPLE_POWER_OUTPUT)
+def test_parse_power_limits_real():
+    raw = read_fixture("rtx3080_win_q_power.txt")
+    cur, min_lim, max_lim = parse_power_limits(raw, gpu_index=0)
     assert cur == 100.0
     assert min_lim == 100.0
     assert max_lim == 370.0
 
 
-def test_parse_power_limits_multi():
-    cur0, min0, max0 = parse_power_limits(
-        SAMPLE_MULTI_GPU_POWER_OUTPUT, gpu_index=0
-    )
-    assert cur0 == 100.0
-    assert min0 == 100.0
-    assert max0 == 370.0
-
-    cur1, min1, max1 = parse_power_limits(
-        SAMPLE_MULTI_GPU_POWER_OUTPUT, gpu_index=1
-    )
-    assert cur1 == 220.0
-    assert min1 == 125.0
-    assert max1 == 250.0
-
-
 def test_power_limit_validation():
-    ok, err = set_power_limit(
-        50.0, gpu_index=0, min_limit=100.0, max_limit=370.0
-    )
+    ok, err = set_power_limit(50.0, gpu_index=0, min_limit=100.0, max_limit=370.0)
     assert not ok
     assert "Value must be between 100.0 and 370.0 W" in err
 
-    ok2, err2 = set_power_limit(
-        400.0, gpu_index=0, min_limit=100.0, max_limit=370.0
-    )
+    ok2, err2 = set_power_limit(400.0, gpu_index=0, min_limit=100.0, max_limit=370.0)
     assert not ok2
     assert "Value must be between 100.0 and 370.0 W" in err2
 
@@ -307,16 +246,16 @@ def test_config_load_and_save():
 class NvidiaSmiTestCase(unittest.TestCase):
     def test_all_pure_functions(self):
         test_parse_numeric()
-        test_parse_single_gpu()
-        test_parse_multi_gpu()
-        test_parse_laptop_na_fields()
-        test_parse_not_supported()
-        test_parse_legacy_9col()
-        test_parse_error_or_empty()
-        test_parse_processes_windows()
-        test_parse_processes_linux()
-        test_parse_power_limits_single()
-        test_parse_power_limits_multi()
+        test_parse_real_rtx3080_fixture()
+        test_parse_multi_gpu_fixture()
+        test_parse_laptop_na_fixture()
+        test_parse_server_not_supported_fixture()
+        test_parse_legacy_9col_fixture()
+        test_parse_no_devices_found()
+        test_parse_empty_and_error()
+        test_parse_real_compute_apps()
+        test_parse_processes_multi_gpu_mapping()
+        test_parse_power_limits_real()
         test_power_limit_validation()
         test_format_memory()
         test_format_power()

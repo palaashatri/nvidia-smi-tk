@@ -2,7 +2,7 @@
 
 A Tkinter desktop monitor for NVIDIA GPUs built on the `nvidia-smi` CLI: live utilisation, memory, temperature, power, clocks and fan, a process table with search, history graphs (matplotlib, optional), tray icon (pystray, optional), desktop alerts (plyer, optional), CSV/JSON export, dark mode, multi-GPU support, and power-limit adjustment.
 
-Code is organized with clear boundaries: `nvidia_smi.py` (queries/pure parsing), `config.py` (configuration persistence to `~/.nvidia_smi_tk_config.json`), and `App.py` (Tkinter GUI entrypoint).
+Code is organized with clear boundaries: `nvidia_smi.py` (queries/pure parsing), `config.py` (configuration persistence to `~/.nvidia_smi_tk_config.json`), `ui/` (modular GUI package: `app`, `dialogs`, `graphs`, `theme`, `tray`), and `App.py` (Tkinter GUI entrypoint).
 
 ## Commands
 
@@ -30,7 +30,7 @@ CI (`.github/workflows/test-build.yml`, `build-release.yml`) verifies syntax com
 - Never call `nvidia-smi` on the Tk main thread, and never touch widgets from the worker thread.
 - Pass arguments as lists to `subprocess` (never `shell=True`), validate power limits against the min/max that `nvidia-smi` reports, and show its error output to the user.
 - Optional dependencies stay optional: the app must start with only the standard library.
-- Keep a clear boundary: `nvidia_smi.py` (queries/parsing), `config.py`, and `App.py`.
+- Keep a clear boundary: `nvidia_smi.py` (queries/parsing), `config.py`, `ui/` package, and `App.py` entrypoint.
 
 ## Git workflow
 
