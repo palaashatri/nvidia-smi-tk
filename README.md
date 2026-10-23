@@ -1,9 +1,8 @@
 # NVIDIA-SMI GUI Monitor
 
 A real-time graphical interface for monitoring NVIDIA GPU status using `nvidia-smi`, with color-coded metrics, multi-GPU support, process table filtering, and power limit adjustment.
-Now with DARK MODE!
 
-<img width="1769" height="1099" alt="image" src="https://github.com/user-attachments/assets/28221887-f2b2-4dd8-a11e-d759bbab4773" />
+![Multi-GPU Dark Mode](docs/screenshots/multi_gpu_overview.png)
 
 ## Overview
 
@@ -23,6 +22,16 @@ This application provides a user-friendly GUI that displays key NVIDIA GPU infor
 - 🌐 **Windows and Linux** - macOS is not supported: current Macs have no NVIDIA driver or `nvidia-smi`
 - 🪶 **Lightweight** - the core runs on the Python standard library alone; extras are optional (`pip install -r requirements.txt`)
 
+## Screenshots
+
+| Multi-GPU & Combined Overview | Process Table Search & Filter |
+|:---:|:---:|
+| ![Multi-GPU Overview](docs/screenshots/multi_gpu_overview.png) | ![Process Filter](docs/screenshots/process_search_filter.png) |
+
+| Power Limit Configuration (Multi-GPU) | Light Theme |
+|:---:|:---:|
+| ![Power Limit Dialog](docs/screenshots/power_limit_dialog.png) | ![Light Theme](docs/screenshots/light_mode_overview.png) |
+
 ## Project Structure
 
 ```
@@ -31,6 +40,7 @@ pytk-nvidia-smi-gui/
 ├── nvidia_smi.py       # Pure nvidia-smi querying, line-by-line parsing, and CLI handlers
 ├── config.py           # Configuration loading, saving, and defaults
 ├── tests/              # Unit & regression tests for parsing, multi-GPU, and mock data
+├── docs/screenshots/   # Visual documentation and screenshots
 ├── requirements.txt    # Optional dependencies (core uses Python standard library only)
 ├── LICENSE             # MIT License
 └── README.md           # Documentation
