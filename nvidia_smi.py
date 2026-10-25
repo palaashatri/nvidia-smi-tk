@@ -6,6 +6,7 @@ import ctypes
 import base64
 import csv
 import math
+import ntpath
 import os
 import platform
 import re
@@ -13,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 from collections.abc import Callable
 from ctypes import wintypes
 from typing import Any
@@ -578,8 +580,8 @@ def _run_windows_elevated(
                 pass
 
 
-def _get_windows_powershell_path() -> str | None:
-    """Resolve Windows PowerShell beneath the Windows system directory."""
+def _get_windows_system_directory() -> str | None:
+    """Resolve the Windows system directory through its authoritative API."""
     if platform.system() != "Windows":
         return None
 
@@ -594,14 +596,101 @@ def _get_windows_powershell_path() -> str | None:
         length = kernel32.GetSystemDirectoryW(system_directory, len(system_directory))
         if not length or length >= len(system_directory):
             return None
-        candidate = os.path.join(
-            system_directory.value,
+        path = system_directory.value
+        return path if ntpath.isabs(path) else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _get_windows_program_files_directory() -> str | None:
+    """Resolve Program Files using the Windows known-folder API."""
+    if platform.system() != "Windows":
+        return None
+
+    class _Guid(ctypes.Structure):
+        _fields_ = [
+            ("Data1", wintypes.DWORD),
+            ("Data2", wintypes.WORD),
+            ("Data3", wintypes.WORD),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    folder_id = _Guid.from_buffer_copy(
+        uuid.UUID("905e63b6-c1bf-494e-b29c-65b732d3d21a").bytes_le
+    )
+    path_pointer = wintypes.LPWSTR()
+    try:
+        shell32 = ctypes.windll.shell32
+        _set_win_api_signature(
+            shell32.SHGetKnownFolderPath,
+            [
+                ctypes.POINTER(_Guid),
+                wintypes.DWORD,
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.LPWSTR),
+            ],
+            ctypes.c_long,
+        )
+        result = shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder_id), 0, None, ctypes.byref(path_pointer)
+        )
+        if result < 0 or not path_pointer.value:
+            return None
+        path = path_pointer.value
+        return path if ntpath.isabs(path) else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    finally:
+        if path_pointer.value:
+            try:
+                ole32 = ctypes.windll.ole32
+                _set_win_api_signature(ole32.CoTaskMemFree, [wintypes.LPWSTR], None)
+                ole32.CoTaskMemFree(path_pointer)
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+
+
+def _resolve_windows_nvidia_smi_path() -> str | None:
+    """Find nvidia-smi only in OS-resolved Windows installation directories."""
+    if platform.system() != "Windows":
+        return None
+
+    system_directory = _get_windows_system_directory()
+    if system_directory and ntpath.isabs(system_directory):
+        system_candidate = ntpath.join(system_directory, "nvidia-smi.exe")
+        if os.path.isfile(system_candidate):
+            return system_candidate
+
+    program_files = _get_windows_program_files_directory()
+    if program_files and ntpath.isabs(program_files):
+        install_candidate = ntpath.join(
+            program_files,
+            "NVIDIA Corporation",
+            "NVSMI",
+            "nvidia-smi.exe",
+        )
+        if os.path.isfile(install_candidate):
+            return install_candidate
+    return None
+
+
+def _get_windows_powershell_path() -> str | None:
+    """Resolve Windows PowerShell beneath the Windows system directory."""
+    system_directory = _get_windows_system_directory()
+    if not system_directory:
+        return None
+
+    try:
+        candidate = ntpath.join(
+            system_directory,
             "WindowsPowerShell",
             "v1.0",
             "powershell.exe",
         )
-        return candidate if os.path.isfile(candidate) else None
-    except (AttributeError, OSError, TypeError, ValueError):
+        return (
+            candidate if ntpath.isabs(candidate) and os.path.isfile(candidate) else None
+        )
+    except (OSError, TypeError, ValueError):
         return None
 
 
@@ -797,13 +886,22 @@ def set_power_limit(
     if command_limit <= 0:
         return False, "Power limit must be a finite positive number."
 
-    executable = shutil.which("nvidia-smi")
-    if not executable:
-        return False, "nvidia-smi was not found on PATH."
+    system = platform.system()
+    if system == "Windows":
+        executable = _resolve_windows_nvidia_smi_path()
+        if not executable:
+            return (
+                False,
+                "Trusted nvidia-smi.exe was not found in the Windows system directory "
+                "or NVIDIA NVSMI installation directory.",
+            )
+    else:
+        executable = shutil.which("nvidia-smi")
+        if not executable:
+            return False, "nvidia-smi was not found on PATH."
 
     arguments = ["-i", str(gpu_index), "-pl", str(command_limit)]
     command = [executable, *arguments]
-    system = platform.system()
     creationflags = 0x08000000 if system == "Windows" else 0
 
     if system == "Windows":
@@ -882,7 +980,7 @@ def set_power_limit(
                 )
             return False, error_output or "Failed to set power limit."
         except subprocess.TimeoutExpired:
-            return False, "nvidia-smi timed out."
+            return False, "nvidia-smi timed out; command completion is unconfirmed."
         except (subprocess.SubprocessError, OSError, ValueError) as exc:
             return False, str(exc)
 
@@ -917,7 +1015,7 @@ def set_power_limit(
             )
         return False, error_output or "Failed to set power limit."
     except subprocess.TimeoutExpired:
-        return False, "Command timed out."
+        return False, "Command timed out; completion is unconfirmed."
     except (subprocess.SubprocessError, OSError, ValueError) as exc:
         return False, str(exc)
 

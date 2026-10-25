@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 import time
+import tkinter as actual_tk
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -47,6 +49,11 @@ class FakeWidget:
         self.after_counter = 0
         self.protocols = {}
         self.destroy_count = 0
+        self.viewable = False
+        self.viewable_error = False
+        self.grab_error = False
+        self.grab_count = 0
+        self.after_idle_callbacks = []
         FakeWidget.created.append(self)
 
     @staticmethod
@@ -67,8 +74,17 @@ class FakeWidget:
 
     configure = config
 
-    def bind(self, event, callback):
+    def bind(self, event, callback, add=None):
         self._check_main_thread()
+        if add and event in self.bindings:
+            existing = self.bindings[event]
+            added_callback = callback
+
+            def chained_callback(*args):
+                existing(*args)
+                added_callback(*args)
+
+            callback = chained_callback
         self.bindings[event] = callback
 
     def current(self, index=None):
@@ -96,6 +112,9 @@ class FakeWidget:
 
     def grab_set(self):
         self._check_main_thread()
+        self.grab_count += 1
+        if self.grab_error:
+            raise RuntimeError("window was destroyed before grab")
 
     def grab_release(self):
         self._check_main_thread()
@@ -111,6 +130,12 @@ class FakeWidget:
         self._check_main_thread()
         return self.exists
 
+    def winfo_viewable(self):
+        self._check_main_thread()
+        if self.viewable_error:
+            raise RuntimeError("window was destroyed before visibility check")
+        return self.exists and self.viewable
+
     def after(self, _delay_ms, callback):
         self._check_main_thread()
         self.after_counter += 1
@@ -123,6 +148,26 @@ class FakeWidget:
         self.after_callbacks = [
             item for item in self.after_callbacks if item[0] != callback_id
         ]
+
+    def after_idle(self, callback):
+        self._check_main_thread()
+        self.after_counter += 1
+        callback_id = f"idle-{self.after_counter}"
+        self.after_idle_callbacks.append((callback_id, callback))
+        return callback_id
+
+    def run_one_idle(self):
+        self._check_main_thread()
+        if self.after_idle_callbacks:
+            _callback_id, callback = self.after_idle_callbacks.pop(0)
+            callback()
+
+    def map(self, *, viewable=True):
+        self._check_main_thread()
+        self.viewable = viewable
+        callback = self.bindings.get("<Map>")
+        if callback is not None:
+            callback(SimpleNamespace(widget=self))
 
     def run_one_after(self):
         self._check_main_thread()
@@ -478,6 +523,76 @@ class PowerDialogRegressionTests(unittest.TestCase):
             self.assertEqual(second_entry.state, "normal")
             self.assertEqual(second_apply.state, "normal")
 
+    def test_modal_dialogs_wait_until_mapped_before_grabbing(self):
+        cases = (
+            (
+                dialogs.open_power_limit_window,
+                self.make_app([{"index": 0, "name": "GPU"}]),
+            ),
+            (
+                dialogs.open_refresh_rate_dialog,
+                SimpleNamespace(root=object(), config={"refresh_rate": 3000}),
+            ),
+            (
+                dialogs.open_alert_settings_dialog,
+                SimpleNamespace(
+                    root=object(),
+                    config={"alert_temp": 80, "alert_util": 90, "alert_enabled": True},
+                ),
+            ),
+        )
+
+        with patch.object(dialogs, "get_power_limits", return_value=(100, 50, 200)):
+            for open_dialog, app in cases:
+                with self.subTest(dialog=open_dialog.__name__):
+                    FakeWidget.created = []
+                    open_dialog(app)
+                    window = next(
+                        widget
+                        for widget in FakeWidget.created
+                        if isinstance(widget, FakeToplevel)
+                    )
+
+                    self.assertEqual(window.grab_count, 0)
+                    self.assertIn("<Map>", window.bindings)
+                    self.assertEqual(len(window.after_idle_callbacks), 1)
+
+                    # A hidden parent can consume its one idle check without spinning.
+                    window.run_one_idle()
+                    self.assertEqual(window.grab_count, 0)
+                    self.assertEqual(window.after_idle_callbacks, [])
+
+                    window.map(viewable=False)
+                    window.run_one_idle()
+                    self.assertEqual(window.grab_count, 0)
+
+                    window.map(viewable=True)
+                    window.run_one_idle()
+                    self.assertEqual(window.grab_count, 1)
+
+                    window.destroy()
+
+    def test_modal_grab_callback_tolerates_destroy_and_tcl_failures(self):
+        for failure in ("destroyed", "visibility", "grab"):
+            with self.subTest(failure=failure):
+                window = FakeToplevel()
+                dialogs._grab_when_viewable(window)
+
+                if failure == "destroyed":
+                    window.destroy()
+                elif failure == "visibility":
+                    window.viewable_error = True
+                else:
+                    window.grab_error = True
+
+                window.map(viewable=True)
+                window.run_one_idle()
+
+                if failure == "grab":
+                    self.assertEqual(window.grab_count, 1)
+                else:
+                    self.assertEqual(window.grab_count, 0)
+
     def test_success_message_includes_backend_diagnostic(self):
         with (
             patch.object(
@@ -705,6 +820,39 @@ class PowerDialogRegressionTests(unittest.TestCase):
             self.assertEqual(app.config["alert_util"], 75)
             self.assertFalse(dialog.exists)
             save.assert_called_once()
+
+
+@unittest.skipUnless(
+    os.name != "nt" and os.environ.get("DISPLAY"), "requires a real Tk display"
+)
+class TkMapGrabIntegrationTests(unittest.TestCase):
+    def test_modal_grab_is_applied_after_the_dialog_maps(self):
+        root = actual_tk.Tk()
+        dialog = None
+        try:
+            root.withdraw()
+            dialog = actual_tk.Toplevel(root)
+            dialog.withdraw()
+            dialogs._grab_when_viewable(dialog)
+
+            root.update_idletasks()
+            self.assertIsNone(dialog.grab_current())
+
+            root.deiconify()
+            dialog.deiconify()
+            root.update()
+
+            self.assertEqual(dialog.grab_status(), "local")
+        finally:
+            if dialog is not None:
+                try:
+                    dialog.grab_release()
+                except actual_tk.TclError:
+                    pass
+            try:
+                root.destroy()
+            except actual_tk.TclError:
+                pass
 
 
 if __name__ == "__main__":

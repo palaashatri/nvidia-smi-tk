@@ -190,9 +190,205 @@ GPU 00000000:02:00.0
 
 
 class PowerLimitRegressionTests(unittest.TestCase):
+    def _trusted_windows_executable(self) -> str:
+        return r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+
     def _successful_process(self) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(
             args=["nvidia-smi"], returncode=0, stdout="Power limit updated", stderr=""
+        )
+
+    def _windows_path_apis(
+        self, system_directory: str, program_files_directory: str
+    ) -> SimpleNamespace:
+        class Kernel32:
+            def GetSystemDirectoryW(self, buffer: object, size: int) -> int:
+                buffer.value = system_directory
+                return len(system_directory)
+
+        class Shell32:
+            def SHGetKnownFolderPath(
+                self,
+                _folder_id: object,
+                _flags: int,
+                _token: object,
+                path_pointer: object,
+            ) -> int:
+                path_pointer._obj.value = program_files_directory
+                return 0
+
+        class Ole32:
+            def CoTaskMemFree(self, _path_pointer: object) -> None:
+                return None
+
+        return SimpleNamespace(kernel32=Kernel32(), shell32=Shell32(), ole32=Ole32())
+
+    def test_windows_power_set_prefers_system_directory_over_path_executable(
+        self,
+    ) -> None:
+        trusted = r"C:\Windows\System32\nvidia-smi.exe"
+        path_executable = r"C:\Users\user\workspace\nvidia-smi.exe"
+        with (
+            patch.object(nvidia_smi.platform, "system", return_value="Windows"),
+            patch.object(
+                nvidia_smi.ctypes,
+                "windll",
+                self._windows_path_apis(r"C:\Windows\System32", r"C:\Program Files"),
+                create=True,
+            ),
+            patch.object(
+                nvidia_smi.os.path,
+                "isfile",
+                side_effect=lambda path: path.casefold() == trusted.casefold(),
+            ),
+            patch.object(
+                nvidia_smi.shutil, "which", return_value=path_executable
+            ) as which,
+            patch.object(
+                nvidia_smi.subprocess, "run", return_value=self._successful_process()
+            ) as run,
+        ):
+            ok, _message = nvidia_smi.set_power_limit(
+                200.0, min_limit=100.0, max_limit=300.0
+            )
+
+        self.assertTrue(ok, _message)
+        self.assertEqual(run.call_args.args[0][0], trusted)
+        which.assert_not_called()
+
+    def test_windows_power_set_falls_back_to_known_program_files_directory(
+        self,
+    ) -> None:
+        trusted = r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+        with (
+            patch.object(nvidia_smi.platform, "system", return_value="Windows"),
+            patch.object(
+                nvidia_smi.ctypes,
+                "windll",
+                self._windows_path_apis(r"C:\Windows\System32", r"C:\Program Files"),
+                create=True,
+            ),
+            patch.object(
+                nvidia_smi.os.path,
+                "isfile",
+                side_effect=lambda path: path.casefold() == trusted.casefold(),
+            ),
+            patch.dict(
+                nvidia_smi.os.environ,
+                {"ProgramFiles": r"C:\Users\user\spoofed-program-files"},
+            ),
+            patch.object(
+                nvidia_smi.shutil,
+                "which",
+                return_value=r"C:\Users\user\workspace\nvidia-smi.exe",
+            ) as which,
+            patch.object(
+                nvidia_smi.subprocess, "run", return_value=self._successful_process()
+            ) as run,
+        ):
+            ok, _message = nvidia_smi.set_power_limit(
+                200.0, min_limit=100.0, max_limit=300.0
+            )
+
+        self.assertTrue(ok, _message)
+        self.assertEqual(run.call_args.args[0][0], trusted)
+        which.assert_not_called()
+
+    def test_windows_power_set_rejects_path_when_no_trusted_executable_exists(
+        self,
+    ) -> None:
+        with (
+            patch.object(nvidia_smi.platform, "system", return_value="Windows"),
+            patch.object(
+                nvidia_smi.ctypes,
+                "windll",
+                self._windows_path_apis(r"C:\Windows\System32", r"C:\Program Files"),
+                create=True,
+            ),
+            patch.object(nvidia_smi.os.path, "isfile", return_value=False),
+            patch.object(
+                nvidia_smi.shutil,
+                "which",
+                return_value=r"C:\Users\user\workspace\nvidia-smi.exe",
+            ) as which,
+            patch.object(
+                nvidia_smi.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    args=["nvidia-smi"],
+                    returncode=1,
+                    stdout="",
+                    stderr="Insufficient Permissions",
+                ),
+            ) as run,
+            patch.object(
+                nvidia_smi,
+                "_run_windows_elevated_with_capture",
+                return_value=(5, "elevated access denied", None),
+            ) as elevated,
+        ):
+            ok, message = nvidia_smi.set_power_limit(
+                200.0, min_limit=100.0, max_limit=300.0
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("trusted", message.lower())
+        which.assert_not_called()
+        run.assert_not_called()
+        elevated.assert_not_called()
+
+    def test_windows_power_set_timeout_marks_completion_unconfirmed(self) -> None:
+        trusted = r"C:\Windows\System32\nvidia-smi.exe"
+        with (
+            patch.object(nvidia_smi.platform, "system", return_value="Windows"),
+            patch.object(
+                nvidia_smi.ctypes,
+                "windll",
+                self._windows_path_apis(r"C:\Windows\System32", r"C:\Program Files"),
+                create=True,
+            ),
+            patch.object(
+                nvidia_smi.os.path,
+                "isfile",
+                side_effect=lambda path: path.casefold() == trusted.casefold(),
+            ),
+            patch.object(nvidia_smi.shutil, "which") as which,
+            patch.object(
+                nvidia_smi.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired([trusted], timeout=15),
+            ),
+        ):
+            ok, message = nvidia_smi.set_power_limit(
+                200.0, min_limit=100.0, max_limit=300.0
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("unconfirmed", message.lower())
+        which.assert_not_called()
+
+    def test_linux_power_set_timeout_marks_completion_unconfirmed(self) -> None:
+        def executable_for(command: str) -> str | None:
+            return "/usr/bin/nvidia-smi" if command == "nvidia-smi" else None
+
+        with (
+            patch.object(nvidia_smi.platform, "system", return_value="Linux"),
+            patch.object(nvidia_smi.shutil, "which", side_effect=executable_for),
+            patch.object(
+                nvidia_smi.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(["nvidia-smi"], timeout=15),
+            ) as run,
+        ):
+            ok, message = nvidia_smi.set_power_limit(
+                200.0, min_limit=100.0, max_limit=300.0
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("unconfirmed", message.lower())
+        self.assertEqual(
+            run.call_args.args[0],
+            ["sudo", "-n", "/usr/bin/nvidia-smi", "-i", "0", "-pl", "200"],
         )
 
     def test_non_finite_and_non_positive_power_limits_are_rejected(self) -> None:
@@ -278,7 +474,9 @@ class PowerLimitRegressionTests(unittest.TestCase):
         with (
             patch.object(nvidia_smi.platform, "system", return_value="Windows"),
             patch.object(
-                nvidia_smi.shutil, "which", return_value="C:\\NVIDIA\\nvidia-smi.exe"
+                nvidia_smi,
+                "_resolve_windows_nvidia_smi_path",
+                return_value=self._trusted_windows_executable(),
             ),
             patch.object(
                 nvidia_smi.subprocess,
@@ -309,7 +507,9 @@ class PowerLimitRegressionTests(unittest.TestCase):
         with (
             patch.object(nvidia_smi.platform, "system", return_value="Windows"),
             patch.object(
-                nvidia_smi.shutil, "which", return_value="C:\\NVIDIA\\nvidia-smi.exe"
+                nvidia_smi,
+                "_resolve_windows_nvidia_smi_path",
+                return_value=self._trusted_windows_executable(),
             ),
             patch.object(
                 nvidia_smi.subprocess,
@@ -370,9 +570,6 @@ class PowerLimitRegressionTests(unittest.TestCase):
             ) as query,
             patch.object(nvidia_smi.subprocess, "run") as run,
             patch.object(nvidia_smi.platform, "system", return_value="Windows"),
-            patch.object(
-                nvidia_smi.shutil, "which", return_value="C:\\NVIDIA\\nvidia-smi.exe"
-            ),
         ):
             ok, message = nvidia_smi.set_power_limit(200.0)
 
@@ -418,7 +615,9 @@ class PowerLimitRegressionTests(unittest.TestCase):
             ) as query,
             patch.object(nvidia_smi.platform, "system", return_value="Windows"),
             patch.object(
-                nvidia_smi.shutil, "which", return_value="C:\\NVIDIA\\nvidia-smi.exe"
+                nvidia_smi,
+                "_resolve_windows_nvidia_smi_path",
+                return_value=self._trusted_windows_executable(),
             ),
             patch.object(
                 nvidia_smi.subprocess, "run", return_value=self._successful_process()
@@ -430,7 +629,7 @@ class PowerLimitRegressionTests(unittest.TestCase):
         query.assert_called_once_with(gpu_index=0)
         self.assertEqual(
             run.call_args.args[0],
-            ["C:\\NVIDIA\\nvidia-smi.exe", "-i", "0", "-pl", "250"],
+            [self._trusted_windows_executable(), "-i", "0", "-pl", "250"],
         )
         self.assertFalse(run.call_args.kwargs.get("shell", False))
 
@@ -469,7 +668,9 @@ class PowerLimitRegressionTests(unittest.TestCase):
         with (
             patch.object(nvidia_smi.platform, "system", return_value="Windows"),
             patch.object(
-                nvidia_smi.shutil, "which", return_value="C:\\NVIDIA\\nvidia-smi.exe"
+                nvidia_smi,
+                "_resolve_windows_nvidia_smi_path",
+                return_value=self._trusted_windows_executable(),
             ),
             patch.object(
                 nvidia_smi.subprocess,
@@ -500,7 +701,7 @@ class PowerLimitRegressionTests(unittest.TestCase):
         self.assertIn("200", message)
         self.assertIn("stdout: complete", message)
         elevated.assert_called_once_with(
-            "C:\\NVIDIA\\nvidia-smi.exe", ["-i", "1", "-pl", "200"], 15
+            self._trusted_windows_executable(), ["-i", "1", "-pl", "200"], 15
         )
         query.assert_called_once_with(gpu_index=1, timeout=15)
 
@@ -508,7 +709,9 @@ class PowerLimitRegressionTests(unittest.TestCase):
         with (
             patch.object(nvidia_smi.platform, "system", return_value="Windows"),
             patch.object(
-                nvidia_smi.shutil, "which", return_value="C:\\NVIDIA\\nvidia-smi.exe"
+                nvidia_smi,
+                "_resolve_windows_nvidia_smi_path",
+                return_value=self._trusted_windows_executable(),
             ),
             patch.object(
                 nvidia_smi.subprocess,

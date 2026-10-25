@@ -7,8 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  actions: read
+  contents: read
 
 jobs:
   test-python:
@@ -33,12 +32,17 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-tk
+          sudo apt-get install -y python3-tk xvfb
 
       - name: Compile application and tests
         run: python -m compileall -q App.py config.py nvidia_smi.py ui tests
 
-      - name: Run unit tests
+      - name: Run unit tests on Linux under Xvfb
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Run unit tests on Windows
+        if: runner.os == 'Windows'
         run: python -m unittest discover -s tests -p "test_*.py" -v
 
   build-windows:
@@ -115,6 +119,8 @@ jobs:
     needs: [test-python, build-windows, build-linux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

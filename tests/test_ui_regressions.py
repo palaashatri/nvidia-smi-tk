@@ -22,18 +22,39 @@ class FakeRoot:
     def __init__(self) -> None:
         self.after_calls: list[tuple[int, object]] = []
         self.cancelled_after: list[str] = []
+        self.pending_after: dict[str, tuple[int, object]] = {}
         self.deiconify_calls = 0
         self.lift_calls = 0
         self._after_index = 0
+        self.quit_calls = 0
+        self.destroy_calls = 0
+        self.window_geometry = "600x500+0+0"
 
     def after(self, delay: int, callback: object) -> str:
         self._after_index += 1
         callback_id = f"after#{self._after_index}"
         self.after_calls.append((delay, callback))
+        self.pending_after[callback_id] = (delay, callback)
         return callback_id
 
     def after_cancel(self, callback_id: str) -> None:
         self.cancelled_after.append(callback_id)
+        self.pending_after.pop(callback_id, None)
+
+    def run_after(self, callback_id: str) -> None:
+        _delay, callback = self.pending_after.pop(callback_id)
+        if not callable(callback):
+            raise AssertionError("scheduled callback is not callable")
+        callback()
+
+    def geometry(self) -> str:
+        return self.window_geometry
+
+    def quit(self) -> None:
+        self.quit_calls += 1
+
+    def destroy(self) -> None:
+        self.destroy_calls += 1
 
     def deiconify(self) -> None:
         self.deiconify_calls += 1
@@ -79,12 +100,20 @@ class FakeTreeview:
     def item(self, item_id: str, option: str | None = None, **kwargs: object):
         item = self._items[item_id]
         if kwargs:
-            item.update(kwargs)
+            item.update(
+                {
+                    key: list(value) if key == "values" else value
+                    for key, value in kwargs.items()
+                }
+            )
         if option == "values":
-            return item["values"]
+            return tuple(str(value) for value in item["values"])
         if option == "tags":
             return item["tags"]
-        return dict(item)
+        return {
+            **item,
+            "values": list(item["values"]),
+        }
 
     def set(self, item_id: str, column: str) -> str:
         columns = {"GPU": 0, "PID": 1, "Name": 2, "Memory": 3}
@@ -103,12 +132,12 @@ class FakeTreeview:
         _parent: str,
         index: str,
         *,
-        values: tuple[str, ...],
+        values: tuple[object, ...],
         tags: tuple[str, ...],
     ) -> str:
         self._next_id += 1
         item_id = f"row{self._next_id}"
-        self._items[item_id] = {"values": values, "tags": tags}
+        self._items[item_id] = {"values": list(values), "tags": tags}
         if index == "end":
             self._children.append(item_id)
         else:
@@ -192,6 +221,10 @@ def make_ui_app(timestamp: datetime, gpu: dict[str, object]) -> GPUMonitorApp:
         "timestamp": timestamp,
     }
     app._cache_lock = threading.Lock()
+    app._snapshot_refresh_generation = 0
+    app._gui_after_id = None
+    app._manual_refresh_pending = False
+    app._manual_refresh_generation = 0
     app.check_alerts = lambda _gpus: None
     app.refresh_process_table = lambda _processes, force=False: None
     app.rebuild_gpu_cards = lambda: None
@@ -260,6 +293,130 @@ class UiStateRegressionTests(unittest.TestCase):
         )
         self.assertEqual(
             (second["gpu_output"], second["proc_output"]), ("GPU B", "process B")
+        )
+
+    def test_manual_refresh_polls_until_a_new_snapshot_arrives(self) -> None:
+        timestamp = datetime(2026, 10, 25, 12, 0, 0)
+        app = make_ui_app(timestamp, make_gpu())
+        app.gpu_data_cache["gpu_output"] = "stale"
+        old_gpu = make_gpu(name="Old GPU")
+        fresh_gpu = make_gpu(name="Fresh GPU")
+
+        def parse_gpu_metrics(output: str) -> list[dict[str, object]]:
+            return [old_gpu if output == "stale" else fresh_gpu]
+
+        with (
+            patch("ui.app.parse_gpu_metrics", side_effect=parse_gpu_metrics),
+            patch("ui.app.parse_processes", return_value=[]),
+        ):
+            app.update_gui()
+            initial_callback = next(iter(app.root.pending_after), None)
+            self.assertIsNotNone(initial_callback)
+
+            app.manual_refresh()
+            app.manual_refresh()
+
+            self.assertEqual(len(app.root.pending_after), 1)
+            callback_id = next(iter(app.root.pending_after))
+            delay, _callback = app.root.pending_after[callback_id]
+            self.assertLessEqual(delay, 100)
+            self.assertIn(initial_callback, app.root.cancelled_after)
+            self.assertTrue(app.update_event.is_set())
+
+            app._publish_gpu_data_snapshot(
+                {
+                    "gpu_output": "stale",
+                    "proc_output": "stale processes",
+                    "timestamp": timestamp,
+                    "_refresh_generation": 0,
+                }
+            )
+            app.root.run_after(callback_id)
+
+            self.assertEqual(
+                app.labels["status"].options.get("text"), "Refreshing metrics..."
+            )
+            self.assertTrue(app._manual_refresh_pending)
+            self.assertEqual(len(app.root.pending_after), 1)
+            callback_id = next(iter(app.root.pending_after))
+            delay, _callback = app.root.pending_after[callback_id]
+            self.assertLessEqual(delay, 100)
+
+            fresh_timestamp = datetime(2026, 10, 25, 12, 0, 1)
+            app._publish_gpu_data_snapshot(
+                {
+                    "gpu_output": "fresh",
+                    "proc_output": "fresh processes",
+                    "timestamp": fresh_timestamp,
+                    "_refresh_generation": app._manual_refresh_generation,
+                }
+            )
+            app.root.run_after(callback_id)
+
+        self.assertEqual(app.labels["gpu"].options.get("text"), "Fresh GPU")
+        self.assertEqual(
+            app.labels["status"].options.get("text"),
+            "Last updated 12:00:01 · Refresh rate 1.0s",
+        )
+        self.assertFalse(app._manual_refresh_pending)
+        self.assertEqual(len(app.root.pending_after), 1)
+
+    def test_shutdown_cancels_the_scheduled_gui_refresh(self) -> None:
+        app = GPUMonitorApp.__new__(GPUMonitorApp)
+        app.root = FakeRoot()
+        app.stop_update = False
+        app.update_event = threading.Event()
+        app.config = {}
+        app.tray_icon = None
+        app._tray_event_after_id = None
+        app._gui_after_id = app.root.after(100, lambda: None)
+        scheduled_id = app._gui_after_id
+
+        with patch("ui.app.save_config"):
+            app.on_closing()
+
+        self.assertIn(scheduled_id, app.root.cancelled_after)
+        self.assertNotIn(scheduled_id, app.root.pending_after)
+        self.assertEqual(app.root.quit_calls, 1)
+        self.assertEqual(app.root.destroy_calls, 1)
+
+    def test_worker_tags_inflight_and_followup_queries_with_request_generation(
+        self,
+    ) -> None:
+        app = make_ui_app(datetime(2026, 10, 25, 12, 0, 0), make_gpu())
+        app.config["refresh_rate"] = 1000
+        app.update_gui = lambda: None
+        query_started = threading.Event()
+        release_query = threading.Event()
+        calls = 0
+
+        def query() -> tuple[str, str]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                query_started.set()
+                if not release_query.wait(timeout=2):
+                    raise TimeoutError("test did not release the first query")
+                return "in-flight old result", "old process rows"
+            app.stop_update = True
+            app.update_event.set()
+            return "post-refresh result", "fresh process rows"
+
+        with (
+            patch("ui.app.get_nvidia_smi_output", side_effect=query),
+            patch("ui.app.get_full_output", return_value=""),
+        ):
+            app.start_background_update()
+            self.assertTrue(query_started.wait(timeout=1))
+            app.manual_refresh()
+            release_query.set()
+            app.update_thread.join(timeout=2)
+
+        self.assertFalse(app.update_thread.is_alive())
+        snapshot = app._read_gpu_data_snapshot()
+        self.assertEqual(snapshot["gpu_output"], "post-refresh result")
+        self.assertEqual(
+            snapshot["_refresh_generation"], app._manual_refresh_generation
         )
 
     def test_init_gui_places_content_in_a_scrollable_canvas(self) -> None:
@@ -551,6 +708,163 @@ class UiStateRegressionTests(unittest.TestCase):
         self.assertEqual(
             tree.item(tree.selection()[0], "values")[:3], ("0", "101", "beta")
         )
+
+    def test_fake_treeview_matches_tcl_value_conversions(self) -> None:
+        tree = FakeTreeview()
+        row = tree.insert(
+            "", "end", values=(0, 101, "alpha.exe", "N/A"), tags=("even",)
+        )
+
+        self.assertEqual(tree.item(row)["values"], [0, 101, "alpha.exe", "N/A"])
+        self.assertEqual(tree.item(row, "values"), ("0", "101", "alpha.exe", "N/A"))
+
+    def test_process_refresh_keeps_unchanged_tcl_rows_and_state(self) -> None:
+        app = GPUMonitorApp.__new__(GPUMonitorApp)
+        tree = FakeTreeview()
+        app.labels = {"proc_table": tree}
+        app.proc_search_query = ""
+        app.current_theme = LIGHT_THEME
+        app.sort_column = None
+        app.sort_reverse = False
+        row = tree.insert(
+            "", "end", values=(0, 101, "alpha.exe", "N/A"), tags=("even", "hover")
+        )
+        tree.selection_set(row)
+        app.hover_row = row
+
+        app.refresh_process_table(
+            [{"gpu": "0", "pid": "101", "name": "alpha.exe", "mem": "N/A"}]
+        )
+
+        self.assertEqual(tree.get_children(), (row,))
+        self.assertEqual(tree.selection(), (row,))
+        self.assertEqual(app.hover_row, row)
+
+    def test_header_and_refresh_use_casefolded_process_name_sorting(self) -> None:
+        processes = [
+            {"gpu": "0", "pid": "1", "name": "alpha", "mem": "1 MiB"},
+            {"gpu": "0", "pid": "2", "name": "Beta", "mem": "2 MiB"},
+            {"gpu": "0", "pid": "3", "name": "gamma", "mem": "3 MiB"},
+        ]
+        header_app = GPUMonitorApp.__new__(GPUMonitorApp)
+        header_tree = FakeTreeview()
+        header_app.labels = {"proc_table": header_tree}
+        header_app.proc_search_query = ""
+        header_app.current_theme = LIGHT_THEME
+        header_app.sort_column = None
+        header_app.sort_reverse = False
+        refresh_app = GPUMonitorApp.__new__(GPUMonitorApp)
+        refresh_tree = FakeTreeview()
+        refresh_app.labels = {"proc_table": refresh_tree}
+        refresh_app.proc_search_query = ""
+        refresh_app.current_theme = LIGHT_THEME
+        refresh_app.sort_column = "Name"
+        refresh_app.sort_reverse = False
+
+        header_app.refresh_process_table(processes)
+        header_app.sort_treeview("Name")
+        refresh_app.refresh_process_table(processes)
+
+        header_names = [
+            header_tree.item(item, "values")[2] for item in header_tree.get_children()
+        ]
+        refresh_names = [
+            refresh_tree.item(item, "values")[2] for item in refresh_tree.get_children()
+        ]
+        self.assertEqual(header_names, ["alpha", "Beta", "gamma"])
+        self.assertEqual(refresh_names, ["alpha", "Beta", "gamma"])
+
+        header_app.sort_treeview("Name")
+        descending_names = [
+            header_tree.item(item, "values")[2] for item in header_tree.get_children()
+        ]
+        self.assertEqual(descending_names, ["gamma", "Beta", "alpha"])
+
+    def test_header_sort_keeps_numbers_before_non_numeric_na_values(self) -> None:
+        processes = [
+            {"gpu": "0", "pid": "x", "name": "unknown", "mem": "1 MiB"},
+            {"gpu": "0", "pid": "N/A", "name": "missing", "mem": "2 MiB"},
+            {"gpu": "0", "pid": "10", "name": "ten", "mem": "3 MiB"},
+            {"gpu": "0", "pid": "2", "name": "two", "mem": "4 MiB"},
+        ]
+        app = GPUMonitorApp.__new__(GPUMonitorApp)
+        tree = FakeTreeview()
+        app.labels = {"proc_table": tree}
+        app.proc_search_query = ""
+        app.current_theme = LIGHT_THEME
+        app.sort_column = None
+        app.sort_reverse = False
+
+        app.refresh_process_table(processes)
+        app.sort_treeview("PID")
+
+        pids = [tree.item(item, "values")[1] for item in tree.get_children()]
+        self.assertEqual(pids, ["2", "10", "N/A", "x"])
+
+    def test_real_treeview_refresh_keeps_item_ids_selection_hover_and_scroll(
+        self,
+    ) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+
+            root = tk.Tk()
+        except tk.TclError:
+            self.skipTest("Tk display is unavailable")
+
+        try:
+            root.overrideredirect(True)
+            root.geometry("300x100+0+0")
+            try:
+                root.attributes("-alpha", 0.0)
+            except tk.TclError:
+                pass
+            tree = ttk.Treeview(
+                root, columns=("GPU", "PID", "Name", "Memory"), height=5
+            )
+            tree.pack(fill="both", expand=True)
+            app = GPUMonitorApp.__new__(GPUMonitorApp)
+            app.labels = {"proc_table": tree}
+            app.proc_search_query = ""
+            app.current_theme = LIGHT_THEME
+            app.sort_column = None
+            app.sort_reverse = False
+            processes = []
+            item_ids = []
+            for index in range(30):
+                process = {
+                    "gpu": "0",
+                    "pid": str(100 + index),
+                    "name": f"app-{index:02d}.exe",
+                    "mem": f"{index} MiB",
+                }
+                processes.append(process)
+                item_ids.append(
+                    tree.insert(
+                        "",
+                        "end",
+                        values=(0, 100 + index, process["name"], process["mem"]),
+                        tags=("even",),
+                    )
+                )
+            selected = item_ids[20]
+            tree.selection_set(selected)
+            tree.item(selected, tags=("even", "hover"))
+            app.hover_row = selected
+            root.update_idletasks()
+            tree.yview_moveto(1.0)
+            before_view = tree.yview()
+
+            app.refresh_process_table(processes)
+            root.update_idletasks()
+
+            self.assertEqual(tree.get_children(), tuple(item_ids))
+            self.assertEqual(tree.selection(), (selected,))
+            self.assertEqual(app.hover_row, selected)
+            self.assertIn("hover", tree.item(selected, "tags"))
+            self.assertEqual(tree.yview(), before_view)
+        finally:
+            root.destroy()
 
     def test_refresh_clears_hovered_row_before_deleting_it(self) -> None:
         try:

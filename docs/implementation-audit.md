@@ -76,7 +76,10 @@ The reviewer reran eight focused regressions successfully. The review led to
 retaining the Always on Top variable, handling an empty GPU list, preserving
 query and elevated-command diagnostics, and disabling Apply on an unconfirmed
 outcome. PowerShell itself is resolved from the Windows system directory;
-the monitored NVIDIA CLI retains the documented executable-on-PATH convention.
+read-only monitoring retains the executable-on-PATH convention. The subsequent
+[PR review follow-up](review-followup.md) restricts Windows power-changing
+commands to the system/NVIDIA installation directories because the PowerShell
+UAC prompt obscures the child executable's identity.
 
 GitHub Actions results are linked from the implementation PR. Its first run
 passed both Windows test jobs and exposed a mocked Windows-path assumption in

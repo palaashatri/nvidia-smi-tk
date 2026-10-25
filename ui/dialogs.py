@@ -14,12 +14,44 @@ from nvidia_smi import get_power_limits_checked as get_power_limits, set_power_l
 from ui.theme import DARK_THEME, LIGHT_THEME
 
 
+def _grab_when_viewable(dialog: tk.Toplevel) -> None:
+    """Acquire a modal grab after Tk maps the dialog, without waiting for it."""
+    grabbed = False
+
+    def try_grab() -> None:
+        nonlocal grabbed
+        if grabbed:
+            return
+        try:
+            if not dialog.winfo_exists() or not dialog.winfo_viewable():
+                return
+            dialog.grab_set()
+        except (tk.TclError, RuntimeError):
+            return
+        grabbed = True
+
+    def on_map(event: Any) -> None:
+        if getattr(event, "widget", dialog) is not dialog:
+            return
+        try:
+            if dialog.winfo_exists():
+                dialog.after_idle(try_grab)
+        except (tk.TclError, RuntimeError):
+            return
+
+    try:
+        dialog.bind("<Map>", on_map, add="+")
+        dialog.after_idle(try_grab)
+    except (tk.TclError, RuntimeError):
+        return
+
+
 def open_power_limit_window(parent_app: Any, initial_gpu_index: int = 0) -> None:
     """Open a GPU-specific dialog whose asynchronous work stays with it."""
     dialog = tk.Toplevel(parent_app.root)
     dialog.title("Power Limit Configuration")
     dialog.resizable(False, False)
-    dialog.grab_set()
+    _grab_when_viewable(dialog)
 
     theme = DARK_THEME if parent_app.config["dark_mode"] else LIGHT_THEME
     dialog.configure(bg=theme["bg"])
@@ -395,7 +427,7 @@ def open_refresh_rate_dialog(parent_app: Any) -> None:
     dialog = tk.Toplevel(parent_app.root)
     dialog.title("Adjust Refresh Rate")
     dialog.resizable(False, False)
-    dialog.grab_set()
+    _grab_when_viewable(dialog)
 
     current_sec = parent_app.config["refresh_rate"] / 1000
     ttk.Label(
@@ -464,7 +496,7 @@ def open_alert_settings_dialog(parent_app: Any) -> None:
     dialog = tk.Toplevel(parent_app.root)
     dialog.title("Alert Settings")
     dialog.resizable(False, False)
-    dialog.grab_set()
+    _grab_when_viewable(dialog)
 
     ttk.Label(
         dialog,

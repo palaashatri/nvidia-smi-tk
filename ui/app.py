@@ -15,7 +15,7 @@ import tkinter as tk
 from collections import deque
 from datetime import datetime
 from tkinter import Menu, messagebox, ttk
-from typing import Any
+from typing import Any, Callable
 
 from config import load_config, save_config
 from nvidia_smi import (
@@ -78,6 +78,10 @@ class GPUMonitorApp:
 
         self.gpu_data_cache: dict[str, Any] = {}
         self._cache_lock = threading.Lock()
+        self._snapshot_refresh_generation = 0
+        self._manual_refresh_generation = 0
+        self._manual_refresh_pending = False
+        self._gui_after_id: str | None = None
         self.tray_event_queue: queue.Queue[str] = queue.Queue()
         self._tray_event_after_id: str | None = None
         self.stop_update = False
@@ -392,20 +396,36 @@ class GPUMonitorApp:
             self.sort_column = col
             self.sort_reverse = False
 
-        items = [
-            (self.labels["proc_table"].set(k, col), k)
-            for k in self.labels["proc_table"].get_children("")
-        ]
-        try:
-            items.sort(
-                key=lambda t: float(t[0].split()[0]) if t[0] and t[0] != "N/A" else 0,
-                reverse=self.sort_reverse,
-            )
-        except (ValueError, IndexError):
-            items.sort(reverse=self.sort_reverse)
+        column_index = {"GPU": 0, "PID": 1, "Name": 2, "Memory": 3}.get(col)
+        if column_index is None:
+            return
 
-        for index, (_val, k) in enumerate(items):
-            self.labels["proc_table"].move(k, "", index)
+        tree = self.labels["proc_table"]
+        item_ids = list(tree.get_children(""))
+        ordered_item_ids = self._sort_process_rows(
+            item_ids,
+            column_index,
+            self.sort_reverse,
+            lambda item_id: tuple(str(value) for value in tree.item(item_id, "values")),
+        )
+        for index, item_id in enumerate(ordered_item_ids):
+            tree.move(item_id, "", index)
+
+    @staticmethod
+    def _sort_process_rows(
+        rows: list[Any],
+        column_index: int,
+        reverse: bool,
+        values_for: Callable[[Any], tuple[str, ...]],
+    ) -> list[Any]:
+        def sort_key(row: Any) -> tuple[int, Any]:
+            value = values_for(row)[column_index]
+            try:
+                return 0, float(value.split()[0])
+            except (ValueError, IndexError):
+                return 1, value.casefold()
+
+        return sorted(rows, key=sort_key, reverse=reverse)
 
     def copy_selected_value(self, column_index: int) -> None:
         selection = self.labels["proc_table"].selection()
@@ -934,18 +954,15 @@ class GPUMonitorApp:
                 self.sort_column
             )
             if column_index is not None:
-
-                def sort_key(row: tuple[str, str, str, str]) -> tuple[int, Any]:
-                    value = row[column_index]
-                    try:
-                        return 0, float(value.split()[0])
-                    except (ValueError, IndexError):
-                        return 1, value.casefold()
-
-                new_items.sort(key=sort_key, reverse=self.sort_reverse)
+                new_items = self._sort_process_rows(
+                    new_items,
+                    column_index,
+                    self.sort_reverse,
+                    lambda row: row,
+                )
 
         current_items = [
-            self.labels["proc_table"].item(c)["values"]
+            tuple(str(value) for value in self.labels["proc_table"].item(c)["values"])
             for c in self.labels["proc_table"].get_children()
         ]
 
@@ -1072,11 +1089,37 @@ class GPUMonitorApp:
                 updated.pop("error", None)
             updated.update(snapshot)
             self.gpu_data_cache = updated
+            if "_refresh_generation" in snapshot:
+                self._snapshot_refresh_generation = snapshot["_refresh_generation"]
 
     def _read_gpu_data_snapshot(self) -> dict[str, Any]:
         """Return one consistent copy of the latest worker snapshot."""
         with self._cache_lock:
-            return dict(self.gpu_data_cache)
+            snapshot = dict(self.gpu_data_cache)
+            snapshot["_refresh_generation"] = getattr(
+                self, "_snapshot_refresh_generation", 0
+            )
+            return snapshot
+
+    def _schedule_gui_update(self, delay_ms: int, *, replace: bool = False) -> None:
+        """Keep exactly one scheduled GUI refresh on Tk's main thread."""
+        if self.stop_update:
+            return
+
+        callback_id = getattr(self, "_gui_after_id", None)
+        if callback_id is not None:
+            if not replace:
+                return
+            try:
+                self.root.after_cancel(callback_id)
+            except tk.TclError:
+                pass
+
+        self._gui_after_id = self.root.after(delay_ms, self._run_scheduled_gui_update)
+
+    def _run_scheduled_gui_update(self) -> None:
+        self._gui_after_id = None
+        self.update_gui()
 
     def start_background_update(self) -> None:
         """Start single background worker thread to query nvidia-smi."""
@@ -1085,12 +1128,15 @@ class GPUMonitorApp:
         def background_worker() -> None:
             full_output_counter = 0
             while not self.stop_update:
+                with self._cache_lock:
+                    refresh_generation = getattr(self, "_manual_refresh_generation", 0)
                 try:
                     gpu_output, proc_output = get_nvidia_smi_output()
                     snapshot: dict[str, Any] = {
                         "gpu_output": gpu_output,
                         "proc_output": proc_output,
                         "timestamp": datetime.now(),
+                        "_refresh_generation": refresh_generation,
                     }
 
                     fetch_full_output = full_output_counter == 0
@@ -1099,7 +1145,12 @@ class GPUMonitorApp:
                         snapshot["full_output"] = get_full_output(timeout=5)
                     self._publish_gpu_data_snapshot(snapshot)
                 except (subprocess.SubprocessError, OSError, ValueError) as exc:
-                    self._publish_gpu_data_snapshot({"error": str(exc)})
+                    self._publish_gpu_data_snapshot(
+                        {
+                            "error": str(exc),
+                            "_refresh_generation": refresh_generation,
+                        }
+                    )
 
                 # Sleep in increments or wait for manual refresh event
                 wait_sec = self.config["refresh_rate"] / 1000
@@ -1113,7 +1164,13 @@ class GPUMonitorApp:
     def manual_refresh(self) -> None:
         """Trigger immediate background fetch without spawning duplicate loops."""
         self.labels["status"].config(text="Refreshing metrics...")
+        with self._cache_lock:
+            self._manual_refresh_generation = (
+                getattr(self, "_manual_refresh_generation", 0) + 1
+            )
+        self._manual_refresh_pending = True
         self.update_event.set()
+        self._schedule_gui_update(50, replace=True)
 
     def update_gui(self) -> None:
         """Main thread GUI refresh function."""
@@ -1121,13 +1178,20 @@ class GPUMonitorApp:
             return
 
         data_snapshot = self._read_gpu_data_snapshot()
+        if getattr(self, "_manual_refresh_pending", False):
+            refresh_generation = data_snapshot.get("_refresh_generation", 0)
+            if refresh_generation < self._manual_refresh_generation:
+                self._schedule_gui_update(100)
+                return
+            self._manual_refresh_pending = False
+
         if "error" in data_snapshot:
             self.labels["gpu"].config(text=f"Error: {data_snapshot['error']}")
-            self.root.after(3000, self.update_gui)
+            self._schedule_gui_update(3000)
             return
 
         if "gpu_output" not in data_snapshot:
-            self.root.after(300, self.update_gui)
+            self._schedule_gui_update(300)
             return
 
         gpu_output = data_snapshot.get("gpu_output", "")
@@ -1139,7 +1203,7 @@ class GPUMonitorApp:
             self.labels["status"].config(
                 text=f"Error at {timestamp.strftime('%H:%M:%S')}"
             )
-            self.root.after(3000, self.update_gui)
+            self._schedule_gui_update(3000)
             return
 
         # Clear any prior transient error once data is good
@@ -1185,7 +1249,7 @@ class GPUMonitorApp:
             self.labels["status"].config(
                 text=f"No NVIDIA GPUs detected · Last checked {time_str}"
             )
-            self.root.after(self.config["refresh_rate"], self.update_gui)
+            self._schedule_gui_update(self.config["refresh_rate"])
             return
 
         # Update metrics for each individual GPU card
@@ -1325,7 +1389,7 @@ class GPUMonitorApp:
             peak_t = max((g.get("temperature") or 0) for g in gpus) if gpus else 0
             self.tray_icon.title = f"GPU: {peak_u:.0f}% | Temp: {peak_t}°C"
 
-        self.root.after(self.config["refresh_rate"], self.update_gui)
+        self._schedule_gui_update(self.config["refresh_rate"])
 
     def _record_history_sample(self, timestamp: datetime, gpu: dict[str, Any]) -> bool:
         """Append a history sample once, preserving unsupported values as gaps."""
@@ -1374,6 +1438,12 @@ class GPUMonitorApp:
             return
         self.stop_update = True
         self.update_event.set()
+        if self._gui_after_id is not None:
+            try:
+                self.root.after_cancel(self._gui_after_id)
+            except tk.TclError:
+                pass
+            self._gui_after_id = None
         if self._tray_event_after_id is not None:
             try:
                 self.root.after_cancel(self._tray_event_after_id)

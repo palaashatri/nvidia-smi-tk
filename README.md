@@ -90,6 +90,11 @@ settings. Live validation must identify the GPU, driver and OS separately from
 the automated suite. Desktop notifications, tray support and privileged power
 changes depend on the operating system and installed services.
 
+On Windows, power changes use `nvidia-smi.exe` from the Windows system directory
+or the NVIDIA NVSMI installation under the system's Program Files directory.
+The power setter rejects custom copies found through `PATH`; read-only
+monitoring still uses `nvidia-smi` on `PATH`.
+
 Configuration is stored in `~/.nvidia_smi_tk_config.json`. History is kept in
 memory for the latest 60 samples and can be exported from the File menu.
 GPU process information comes from the driver's compute-app query; Windows
