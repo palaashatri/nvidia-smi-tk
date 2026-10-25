@@ -2,107 +2,98 @@ name: Build Test
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
+
+permissions:
+  contents: read
 
 jobs:
-  test-build-windows:
-    runs-on: windows-latest
-    
+  test-python:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ['3.10', '3.12']
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller
-        
-    - name: Test Windows build
-      run: |
-        pyinstaller --onefile --noconsole --name "nvidia-smi-gui-monitor-test" App.py
-        
-    - name: Verify test build
-      run: |
-        if (Test-Path "dist/nvidia-smi-gui-monitor-test.exe") {
-          Write-Output "✅ Windows build test passed"
-          Get-Item "dist/nvidia-smi-gui-monitor-test.exe" | Select-Object Name, Length
-        } else {
-          Write-Error "❌ Windows build test failed!"
-          exit 1
-        }
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Tk on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk xvfb
+
+      - name: Compile application and tests
+        run: python -m compileall -q App.py config.py nvidia_smi.py ui tests
+
+      - name: Run unit tests on Linux under Xvfb
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Run unit tests on Windows
+        if: runner.os == 'Windows'
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+  test-build-windows:
+    needs: test-python
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build and optional dependencies
+        run: python -m pip install -r requirements.txt pyinstaller==6.16.0
+
+      - name: Build Windows executable
+        run: pyinstaller --onefile --noconsole --name nvidia-smi-gui-monitor-test App.py
+
+      - name: Verify Windows executable
+        run: |
+          if (Test-Path "dist/nvidia-smi-gui-monitor-test.exe") {
+            Get-Item "dist/nvidia-smi-gui-monitor-test.exe" | Select-Object Name, Length
+          } else {
+            Write-Error "Windows build artifact was not created."
+            exit 1
+          }
 
   test-build-linux:
+    needs: test-python
     runs-on: ubuntu-latest
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y python3-tk
-        
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller
-        
-    - name: Test Linux build
-      run: |
-        pyinstaller --onefile --name "nvidia-smi-gui-monitor-test" App.py
-        
-    - name: Verify test build
-      run: |
-        if [ -f "dist/nvidia-smi-gui-monitor-test" ]; then
-          echo "✅ Linux build test passed"
-          ls -la dist/nvidia-smi-gui-monitor-test
-        else
-          echo "❌ Linux build test failed!"
-          exit 1
-        fi
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-  test-python-syntax:
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        
-    - name: Check Python syntax
-      run: |
-        python -m py_compile App.py
-        echo "✅ Python syntax check passed"
-        
-    - name: Test imports (without nvidia-smi)
-      run: |
-        python -c "
-        import sys
-        sys.path.insert(0, '.')
-        try:
-            import tkinter as tk
-            from tkinter import ttk
-            import subprocess
-            import re
-            print('✅ All required modules can be imported')
-        except ImportError as e:
-            print(f'❌ Import error: {e}')
-            sys.exit(1)
-        "
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Tk on Linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Install build and optional dependencies
+        run: python -m pip install -r requirements.txt pyinstaller==6.16.0
+
+      - name: Build Linux executable
+        run: pyinstaller --onefile --name nvidia-smi-gui-monitor-test App.py
+
+      - name: Verify Linux executable
+        run: test -f dist/nvidia-smi-gui-monitor-test
