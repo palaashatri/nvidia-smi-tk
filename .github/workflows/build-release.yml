@@ -3,178 +3,184 @@ name: Build and Release
 on:
   push:
     tags:
-      - 'v*'  # Triggers on version tags like v1.0.0, v1.2.3, etc.
-  workflow_dispatch:  # Allows manual triggering
+      - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
   actions: read
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
-    
+  test-python:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ['3.10', '3.12']
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller
-        
-    - name: Build Windows executable
-      run: |
-        pyinstaller --onefile --noconsole --name "NVIDIA-SMI Monitor" --icon=NONE App.py
-        
-    - name: Verify executable
-      run: |
-        if (Test-Path "dist/NVIDIA-SMI Monitor.exe") {
-          Write-Output "✅ Executable built successfully"
-          Get-Item "dist/NVIDIA-SMI Monitor.exe" | Format-List Name, Length, LastWriteTime
-        } else {
-          Write-Error "❌ Executable not found!"
-          exit 1
-        }
-        
-    - name: Upload Windows artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: nvidia-smi-monitor-windows
-        path: dist/NVIDIA-SMI Monitor.exe
-        retention-days: 30
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Tk on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Compile application and tests
+        run: python -m compileall -q App.py config.py nvidia_smi.py ui tests
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+  build-windows:
+    needs: test-python
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build and optional dependencies
+        run: python -m pip install -r requirements.txt pyinstaller==6.16.0
+
+      - name: Build Windows executable
+        run: pyinstaller --onefile --noconsole --name "NVIDIA-SMI Monitor" --icon=NONE App.py
+
+      - name: Verify Windows executable
+        run: |
+          if (Test-Path "dist/NVIDIA-SMI Monitor.exe") {
+            Get-Item "dist/NVIDIA-SMI Monitor.exe" | Format-List Name, Length, LastWriteTime
+          } else {
+            Write-Error "Windows executable was not created."
+            exit 1
+          }
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvidia-smi-monitor-windows
+          path: dist/NVIDIA-SMI Monitor.exe
+          retention-days: 30
 
   build-linux:
+    needs: test-python
     runs-on: ubuntu-latest
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y python3-tk
-        
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller
-        
-    - name: Build Linux executable
-      run: |
-        pyinstaller --onefile --name "nvidia-smi-monitor" App.py
-        
-    - name: Make executable
-      run: |
-        chmod +x dist/nvidia-smi-monitor
-        
-    - name: Verify executable
-      run: |
-        if [ -f "dist/nvidia-smi-monitor" ]; then
-          echo "✅ Executable built successfully"
-          ls -la dist/nvidia-smi-monitor
-        else
-          echo "❌ Executable not found!"
-          exit 1
-        fi
-        
-    - name: Upload Linux artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: nvidia-smi-monitor-linux
-        path: dist/nvidia-smi-monitor
-        retention-days: 30
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Tk on Linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Install build and optional dependencies
+        run: python -m pip install -r requirements.txt pyinstaller==6.16.0
+
+      - name: Build Linux executable
+        run: pyinstaller --onefile --name nvidia-smi-monitor App.py
+
+      - name: Make Linux executable
+        run: chmod +x dist/nvidia-smi-monitor
+
+      - name: Verify Linux executable
+        run: test -f dist/nvidia-smi-monitor
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvidia-smi-monitor-linux
+          path: dist/nvidia-smi-monitor
+          retention-days: 30
 
   create-release:
-    needs: [build-windows, build-linux]
+    needs: [test-python, build-windows, build-linux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Download Windows artifact
-      uses: actions/download-artifact@v4
-      with:
-        name: nvidia-smi-monitor-windows
-        path: ./artifacts/windows/
-        
-    - name: Download Linux artifact
-      uses: actions/download-artifact@v4
-      with:
-        name: nvidia-smi-monitor-linux
-        path: ./artifacts/linux/
-        
-    - name: Get version from tag
-      id: get_version
-      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-      
-    - name: Generate release notes
-      id: release_notes
-      run: |
-        cat > release_notes.md << 'EOF'
-        ## 🚀 NVIDIA-SMI GUI Monitor ${{ steps.get_version.outputs.VERSION }}
-        
-        A real-time graphical interface for monitoring NVIDIA GPU status with color-coded metrics, process monitoring, and power limit adjustment.
-        
-        ### 📥 Downloads
-        
-        - **Windows Users**: Download `NVIDIA-SMI Monitor.exe` - No Python installation required!
-        - **Linux Users**: Download `nvidia-smi-monitor` - Make executable with `chmod +x` before running
-        
-        ### ✨ Features
-        
-        - 🔄 Real-time GPU monitoring (updates every 2 seconds)
-        - 🎨 Color-coded metrics (utilization, memory, temperature, power)
-        - 📊 Running processes table with PID, name, and memory usage
-        - ⚡ GPU power limit adjustment (requires admin privileges)
-        - 📋 Full nvidia-smi output view
-        - 🛡️ Error handling and cross-platform compatibility
-        
-        ### 📋 Requirements
-        
-        - NVIDIA GPU with compatible drivers
-        - `nvidia-smi` utility accessible from command line
-        - For power limit changes: Administrator/root privileges
-        
-        ### 🐛 Bug Reports & Support
-        
-        If you encounter any issues, please create an issue with:
-        - Your operating system and version
-        - NVIDIA driver version (`nvidia-smi --version`)
-        - Error message or unexpected behavior description
-        
-        ### 🙏 Thank you for using NVIDIA-SMI GUI Monitor!
-        EOF
-        
-    - name: Create Release
-      uses: softprops/action-gh-release@v2
-      with:
-        name: "NVIDIA-SMI Monitor ${{ steps.get_version.outputs.VERSION }}"
-        body_path: release_notes.md
-        draft: false
-        prerelease: false
-        files: |
-          ./artifacts/windows/NVIDIA-SMI Monitor.exe
-          ./artifacts/linux/nvidia-smi-monitor
-        token: ${{ secrets.GITHUB_TOKEN }}
-        
-    - name: Upload release assets info
-      run: |
-        echo "✅ Release created successfully!"
-        echo "📦 Assets uploaded:"
-        echo "  - NVIDIA-SMI Monitor.exe (Windows)"
-        echo "  - nvidia-smi-monitor (Linux)"
-        echo "🔗 Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ steps.get_version.outputs.VERSION }}"
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nvidia-smi-monitor-windows
+          path: ./artifacts/windows/
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nvidia-smi-monitor-linux
+          path: ./artifacts/linux/
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          cat > release_notes.md << 'EOF'
+          ## 🚀 NVIDIA-SMI GUI Monitor ${{ steps.get_version.outputs.VERSION }}
+
+          A real-time graphical interface for monitoring NVIDIA GPU status with color-coded metrics, process monitoring, and power limit adjustment.
+
+          ### 📥 Downloads
+
+          - **Windows Users**: Download `NVIDIA-SMI Monitor.exe` - No Python installation required!
+          - **Linux Users**: Download `nvidia-smi-monitor` - Make executable with `chmod +x` before running
+
+          ### ✨ Features
+
+          - 🔄 Real-time GPU monitoring (updates every 3 seconds by default; configurable from 0.5 to 60 seconds)
+          - 🎨 Color-coded metrics (utilization, memory, temperature, power)
+          - 📊 Running processes table with PID, name, and memory usage
+          - ⚡ GPU power limit adjustment (requires admin privileges)
+          - 📋 Full nvidia-smi output view
+          - 🛡️ Error handling and cross-platform compatibility
+
+          ### 📋 Requirements
+
+          - NVIDIA GPU with compatible drivers
+          - `nvidia-smi` utility accessible from command line
+          - For power limit changes: Administrator/root privileges
+
+          ### 🐛 Bug Reports & Support
+
+          If you encounter any issues, please create an issue with:
+          - Your operating system and version
+          - NVIDIA driver version (`nvidia-smi --version`)
+          - Error message or unexpected behavior description
+
+          ### 🙏 Thank you for using NVIDIA-SMI GUI Monitor!
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "NVIDIA-SMI Monitor ${{ steps.get_version.outputs.VERSION }}"
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          files: |
+            ./artifacts/windows/NVIDIA-SMI Monitor.exe
+            ./artifacts/linux/nvidia-smi-monitor
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -10,20 +10,19 @@
 # - collections (for deque data structure)
 
 # Optional dependencies for enhanced features:
-matplotlib>=3.3.0        # For historical graphs (optional)
-pillow>=8.0.0           # For system tray icon (optional)
-pystray>=0.17.0         # For system tray functionality (optional)
-plyer>=2.0.0            # For desktop notifications (optional)
+matplotlib==3.10.7      # For historical graphs (optional)
+pillow==12.0.0          # For system tray icon (optional)
+pystray==0.19.5         # For system tray functionality (optional)
+plyer==2.1.0            # For desktop notifications (optional)
 
 # System Requirements:
-# - Python 3.6 or higher
+# - Python 3.10 or higher
 # - NVIDIA GPU with compatible drivers
 # - nvidia-smi utility (included with NVIDIA drivers)
 
 # Platform-specific notes:
 # Linux (Ubuntu/Debian): sudo apt-get install python3-tk
 # Linux (CentOS/RHEL):   sudo yum install tkinter  
-# macOS:                 Usually included with Python
 # Windows:               Usually included with Python
 
 # Install all optional dependencies:

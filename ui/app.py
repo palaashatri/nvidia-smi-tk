@@ -6,6 +6,7 @@ import csv
 import json
 import os
 import platform
+import queue
 import re
 import subprocess
 import threading
@@ -23,6 +24,7 @@ from nvidia_smi import (
     color_for_temp,
     format_memory,
     format_power,
+    get_full_output,
     get_nvidia_smi_output,
     parse_gpu_metrics,
     parse_processes,
@@ -49,7 +51,7 @@ except ImportError:
 
 
 class GPUMonitorApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.config = load_config()
         self.labels: dict[str, Any] = {}
@@ -63,6 +65,8 @@ class GPUMonitorApp:
         self.proc_search_query = ""
         self.tray_icon: Any = None
         self.last_alert_time: dict[str, float] = {}
+        self.current_gpu_identity: tuple[tuple[Any, Any, Any], ...] = ()
+        self.last_history_timestamp: datetime | None = None
 
         self.history_data = {
             "time": deque(maxlen=HISTORY_SIZE),
@@ -73,14 +77,17 @@ class GPUMonitorApp:
         }
 
         self.gpu_data_cache: dict[str, Any] = {}
+        self._cache_lock = threading.Lock()
+        self.tray_event_queue: queue.Queue[str] = queue.Queue()
+        self._tray_event_after_id: str | None = None
         self.stop_update = False
         self.update_event = threading.Event()
         self.update_thread: threading.Thread | None = None
 
         self.root.title(f"NVIDIA-SMI GPU Monitor v{VERSION}")
         self.root.geometry(
-            f"{self.config['window_width']}x{self.config['window_height']}+"
-            f"{self.config['window_x']}+{self.config['window_y']}"
+            f"{self.config['window_width']}x{self.config['window_height']}"
+            f"{self.config['window_x']:+d}{self.config['window_y']:+d}"
         )
 
         self.setup_menu()
@@ -92,10 +99,11 @@ class GPUMonitorApp:
             self.root.attributes("-topmost", True)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self._tray_event_after_id = self.root.after(50, self._poll_tray_events)
         self.start_background_update()
         self.tray_icon = setup_tray_icon(self)
 
-    def setup_menu(self):
+    def setup_menu(self) -> None:
         menubar = Menu(self.root)
         self.root.config(menu=menubar)
 
@@ -115,10 +123,13 @@ class GPUMonitorApp:
             command=self.toggle_theme,
             accelerator="Ctrl+D",
         )
+        self.always_on_top_var: tk.BooleanVar = tk.BooleanVar(
+            value=self.config.get("always_on_top", False)
+        )
         view_menu.add_checkbutton(
             label="Always on Top",
             command=self.toggle_always_on_top,
-            variable=tk.BooleanVar(value=self.config.get("always_on_top", False)),
+            variable=self.always_on_top_var,
         )
         view_menu.add_command(
             label="Refresh", command=self.manual_refresh, accelerator="F5"
@@ -146,16 +157,18 @@ class GPUMonitorApp:
             command=lambda: show_about_dialog(VERSION, self.labels["gpu"].cget("text")),
         )
 
-    def setup_keyboard_shortcuts(self):
+    def setup_keyboard_shortcuts(self) -> None:
         self.root.bind("<F5>", lambda _e: self.manual_refresh())
         self.root.bind("<Control-q>", lambda _e: self.on_closing())
         self.root.bind("<Control-d>", lambda _e: self.toggle_theme())
         self.root.bind("<Control-g>", lambda _e: self.show_graphs())
 
-    def apply_theme(self):
+    def apply_theme(self) -> None:
         self.current_theme = DARK_THEME if self.config["dark_mode"] else LIGHT_THEME
         theme = self.current_theme
         self.root.configure(bg=theme["bg"])
+        if hasattr(self, "content_canvas"):
+            self.content_canvas.configure(bg=theme["bg"])
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -282,31 +295,33 @@ class GPUMonitorApp:
         )
         style.configure("MainContainer.TFrame", background=theme["bg"])
 
-    def update_text_widget_colors(self):
+    def update_text_widget_colors(self) -> None:
         theme = DARK_THEME if self.config["dark_mode"] else LIGHT_THEME
         if "full_output_text" in self.labels:
             self.labels["full_output_text"].config(
                 bg=theme["text_bg"], fg=theme["text_fg"]
             )
 
-    def toggle_theme(self):
+    def toggle_theme(self) -> None:
         self.config["dark_mode"] = not self.config["dark_mode"]
         save_config(self.config)
         self.apply_theme()
         self.update_text_widget_colors()
         self.rebuild_gpu_cards()
 
-    def toggle_always_on_top(self):
+    def toggle_always_on_top(self) -> None:
         self.config["always_on_top"] = not self.config.get("always_on_top", False)
+        if hasattr(self, "always_on_top_var"):
+            self.always_on_top_var.set(self.config["always_on_top"])
         self.root.attributes("-topmost", self.config["always_on_top"])
         save_config(self.config)
 
-    def show_graphs(self):
+    def show_graphs(self) -> None:
         if not self.graph_window:
             self.graph_window = HistoryGraphWindow(self)
         self.graph_window.show()
 
-    def export_csv(self):
+    def export_csv(self) -> None:
         from tkinter import filedialog
 
         filename = filedialog.asksaveasfilename(
@@ -340,7 +355,7 @@ class GPUMonitorApp:
         except OSError:
             messagebox.showerror("Error", "Failed to export CSV.")
 
-    def export_json(self):
+    def export_json(self) -> None:
         from tkinter import filedialog
 
         filename = filedialog.asksaveasfilename(
@@ -370,7 +385,7 @@ class GPUMonitorApp:
         except OSError:
             messagebox.showerror("Error", "Failed to export JSON.")
 
-    def sort_treeview(self, col: str):
+    def sort_treeview(self, col: str) -> None:
         if self.sort_column == col:
             self.sort_reverse = not self.sort_reverse
         else:
@@ -392,7 +407,7 @@ class GPUMonitorApp:
         for index, (_val, k) in enumerate(items):
             self.labels["proc_table"].move(k, "", index)
 
-    def copy_selected_value(self, column_index: int):
+    def copy_selected_value(self, column_index: int) -> None:
         selection = self.labels["proc_table"].selection()
         if not selection:
             return
@@ -403,7 +418,7 @@ class GPUMonitorApp:
         self.root.clipboard_append(str(values[column_index]))
         self.labels["status"].config(text=f"Copied: {values[column_index]}")
 
-    def end_selected_task(self):
+    def end_selected_task(self) -> None:
         selection = self.labels["proc_table"].selection()
         if not selection:
             return
@@ -426,7 +441,7 @@ class GPUMonitorApp:
         except (subprocess.SubprocessError, OSError) as exc:
             messagebox.showerror("Error", f"Could not end task: {exc}")
 
-    def init_gui(self):
+    def init_gui(self) -> None:
         theme = self.current_theme
 
         # Top Header Banner
@@ -486,7 +501,7 @@ class GPUMonitorApp:
         toolbar_inner = tk.Frame(toolbar, bg=theme["bg"])
         toolbar_inner.pack(side="left", padx=15, pady=6)
 
-        def make_toolbar_btn(text: str, cmd: Any, tooltip: str):
+        def make_toolbar_btn(text: str, cmd: Any, tooltip: str) -> tk.Button:
             btn = tk.Button(
                 toolbar_inner,
                 text=text,
@@ -511,9 +526,33 @@ class GPUMonitorApp:
         make_toolbar_btn("Graphs", self.show_graphs, "Open graphs (Ctrl+G)")
         make_toolbar_btn("Theme", self.toggle_theme, "Toggle theme (Ctrl+D)")
 
-        # Main scrollable container for GPU cards and content
-        self.cards_parent_frame = ttk.Frame(self.root, style="MainContainer.TFrame")
-        self.cards_parent_frame.pack(fill="both", expand=True, padx=20, pady=(10, 0))
+        # Place GPU cards and process details inside a real scrollable canvas.
+        content_shell = tk.Frame(self.root, bg=theme["bg"])
+        content_shell.pack(fill="both", expand=True, padx=20, pady=(10, 0))
+        self.content_canvas = tk.Canvas(
+            content_shell,
+            bg=theme["bg"],
+            highlightthickness=0,
+            yscrollincrement=24,
+        )
+        self.content_canvas.pack(side="left", fill="both", expand=True)
+        content_scrollbar = ttk.Scrollbar(
+            content_shell, orient="vertical", command=self.content_canvas.yview
+        )
+        content_scrollbar.pack(side="right", fill="y")
+        self.content_canvas.configure(yscrollcommand=content_scrollbar.set)
+
+        self.cards_parent_frame = ttk.Frame(
+            self.content_canvas, style="MainContainer.TFrame"
+        )
+        self._cards_window = self.content_canvas.create_window(
+            (0, 0), window=self.cards_parent_frame, anchor="nw"
+        )
+        self.cards_parent_frame.bind("<Configure>", self._update_content_scrollregion)
+        self.content_canvas.bind("<Configure>", self._resize_content_window)
+        self.content_canvas.bind("<MouseWheel>", self._scroll_content)
+        self.content_canvas.bind("<Button-4>", self._scroll_content)
+        self.content_canvas.bind("<Button-5>", self._scroll_content)
 
         self.gpu_cards_container = ttk.Frame(
             self.cards_parent_frame, style="MainContainer.TFrame"
@@ -594,27 +633,9 @@ class GPUMonitorApp:
         self.labels["proc_table"].pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        def on_motion(event: tk.Event):
-            row = self.labels["proc_table"].identify_row(event.y)
-            if row == self.hover_row:
-                return
-            if self.hover_row:
-                tags = [
-                    t
-                    for t in self.labels["proc_table"].item(self.hover_row, "tags")
-                    if t != "hover"
-                ]
-                self.labels["proc_table"].item(self.hover_row, tags=tags)
-            self.hover_row = row
-            if row:
-                tags = list(self.labels["proc_table"].item(row, "tags"))
-                if "hover" not in tags:
-                    tags.append("hover")
-                self.labels["proc_table"].item(row, tags=tags)
+        self.labels["proc_table"].bind("<Motion>", self._on_process_tree_motion)
 
-        self.labels["proc_table"].bind("<Motion>", on_motion)
-
-        def show_context(event: tk.Event):
+        def show_context(event: tk.Event) -> None:
             row = self.labels["proc_table"].identify_row(event.y)
             if row:
                 self.labels["proc_table"].selection_set(row)
@@ -626,7 +647,7 @@ class GPUMonitorApp:
         self.labels["proc_table"].bind("<Button-3>", show_context)
 
         # Collapsible Full Output
-        def toggle_full_output():
+        def toggle_full_output() -> None:
             if self.labels["full_output_frame"].winfo_ismapped():
                 self.labels["full_output_frame"].pack_forget()
                 self.labels["show_btn"].config(text="Show Detailed Output")
@@ -823,13 +844,32 @@ class GPUMonitorApp:
 
         return summary_widgets
 
-    def rebuild_gpu_cards(self):
+    def rebuild_gpu_cards(self) -> None:
         """Reconstruct GPU metric cards when GPUs are discovered or theme toggled."""
         for child in self.gpu_cards_container.winfo_children():
             child.destroy()
 
         self.gpu_cards.clear()
-        gpus = self.current_gpus or [{"index": 0, "name": "NVIDIA GPU"}]
+        metric_aliases = (
+            "util",
+            "util_bar",
+            "mem",
+            "mem_bar",
+            "temp",
+            "temp_bar",
+            "power",
+            "power_bar",
+            "fan",
+            "clock_gpu",
+            "clock_mem",
+        )
+        for key in metric_aliases:
+            self.labels.pop(key, None)
+
+        gpus = self.current_gpus
+        if not gpus:
+            self.combined_widgets = {}
+            return
 
         if len(gpus) > 1:
             self.combined_widgets = self.create_combined_summary_card(
@@ -850,20 +890,20 @@ class GPUMonitorApp:
             )
             self.gpu_cards[idx] = card_widgets
 
-        # Primary GPU alias for single GPU backward compatibility
-        if 0 in self.gpu_cards:
-            for k, w in self.gpu_cards[0].items():
-                if k != "frame":
-                    self.labels[k] = w
+        # Keep aliases pointed at the first currently detected GPU card.
+        primary_widgets = next(iter(self.gpu_cards.values()), {})
+        for key, widget in primary_widgets.items():
+            if key != "frame":
+                self.labels[key] = widget
 
-    def apply_proc_filter(self):
+    def apply_proc_filter(self) -> None:
         """Filter running processes in the treeview based on user search query."""
         self.proc_search_query = self.filter_entry_var.get().strip().lower()
         self.refresh_process_table(self.last_process_list, force=True)
 
     def refresh_process_table(
         self, processes: list[dict[str, str]], force: bool = False
-    ):
+    ) -> None:
         """Update process treeview with optional filtering and striping."""
         filtered = [
             p
@@ -873,15 +913,44 @@ class GPUMonitorApp:
             or self.proc_search_query in p.get("pid", "").lower()
         ]
 
+        selected_key: tuple[str, str, str] | None = None
+        selection = self.labels["proc_table"].selection()
+        if selection:
+            selected_values = self.labels["proc_table"].item(selection[0], "values")
+            if len(selected_values) >= 3:
+                selected_key = tuple(str(value) for value in selected_values[:3])
+
+        new_items = [
+            (
+                str(p.get("gpu", "0")),
+                str(p.get("pid", "")),
+                str(p.get("name", "")),
+                str(p.get("mem", "")),
+            )
+            for p in filtered
+        ]
+        if self.sort_column:
+            column_index = {"GPU": 0, "PID": 1, "Name": 2, "Memory": 3}.get(
+                self.sort_column
+            )
+            if column_index is not None:
+
+                def sort_key(row: tuple[str, str, str, str]) -> tuple[int, Any]:
+                    value = row[column_index]
+                    try:
+                        return 0, float(value.split()[0])
+                    except (ValueError, IndexError):
+                        return 1, value.casefold()
+
+                new_items.sort(key=sort_key, reverse=self.sort_reverse)
+
         current_items = [
             self.labels["proc_table"].item(c)["values"]
             for c in self.labels["proc_table"].get_children()
         ]
-        new_items = [
-            (p.get("gpu", "0"), p["pid"], p["name"], p["mem"]) for p in filtered
-        ]
 
         if force or current_items != new_items:
+            self.hover_row = None
             self.labels["proc_table"].delete(*self.labels["proc_table"].get_children())
             theme = self.current_theme
             self.labels["proc_table"].tag_configure(
@@ -893,21 +962,56 @@ class GPUMonitorApp:
             self.labels["proc_table"].tag_configure(
                 "hover", background=theme["hover_bg"], foreground=theme["fg"]
             )
-            for idx, proc in enumerate(filtered):
+            selected_item: str | None = None
+            for idx, row in enumerate(new_items):
                 tag = "even" if idx % 2 == 0 else "odd"
-                self.labels["proc_table"].insert(
+                item_id = self.labels["proc_table"].insert(
                     "",
                     "end",
-                    values=(
-                        proc.get("gpu", "0"),
-                        proc["pid"],
-                        proc["name"],
-                        proc["mem"],
-                    ),
+                    values=row,
                     tags=(tag,),
                 )
+                if selected_key == row[:3]:
+                    selected_item = item_id
+            if selected_item is not None:
+                self.labels["proc_table"].selection_set(selected_item)
 
-    def check_alerts(self, gpus: list[dict[str, Any]]):
+    def _on_process_tree_motion(self, event: tk.Event) -> None:
+        tree = self.labels["proc_table"]
+        row = tree.identify_row(event.y)
+        if row == self.hover_row:
+            return
+        if self.hover_row:
+            try:
+                tags = [
+                    tag for tag in tree.item(self.hover_row, "tags") if tag != "hover"
+                ]
+                tree.item(self.hover_row, tags=tags)
+            except tk.TclError:
+                pass
+        self.hover_row = row
+        if row:
+            tags = list(tree.item(row, "tags"))
+            if "hover" not in tags:
+                tags.append("hover")
+            tree.item(row, tags=tags)
+
+    def _update_content_scrollregion(self, _event: tk.Event | None = None) -> None:
+        self.content_canvas.configure(scrollregion=self.content_canvas.bbox("all"))
+
+    def _resize_content_window(self, event: tk.Event) -> None:
+        self.content_canvas.itemconfigure(self._cards_window, width=event.width)
+
+    def _scroll_content(self, event: tk.Event) -> str:
+        if getattr(event, "num", None) == 4:
+            self.content_canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            self.content_canvas.yview_scroll(1, "units")
+        else:
+            self.content_canvas.yview_scroll(int(-event.delta / 120), "units")
+        return "break"
+
+    def check_alerts(self, gpus: list[dict[str, Any]]) -> None:
         """Check all GPUs against configured alert thresholds."""
         if not self.config.get("alert_enabled", True) or not PLYER_AVAILABLE:
             return
@@ -958,39 +1062,44 @@ class GPUMonitorApp:
                     pass
                 self.last_alert_time[util_key] = current_time
 
-    def start_background_update(self):
+    def _publish_gpu_data_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Atomically publish a complete cache snapshot from the worker."""
+        with self._cache_lock:
+            updated = dict(self.gpu_data_cache)
+            if "error" in snapshot:
+                updated["error"] = snapshot["error"]
+            else:
+                updated.pop("error", None)
+            updated.update(snapshot)
+            self.gpu_data_cache = updated
+
+    def _read_gpu_data_snapshot(self) -> dict[str, Any]:
+        """Return one consistent copy of the latest worker snapshot."""
+        with self._cache_lock:
+            return dict(self.gpu_data_cache)
+
+    def start_background_update(self) -> None:
         """Start single background worker thread to query nvidia-smi."""
         self.stop_update = False
 
-        def background_worker():
+        def background_worker() -> None:
             full_output_counter = 0
             while not self.stop_update:
                 try:
                     gpu_output, proc_output = get_nvidia_smi_output()
-                    self.gpu_data_cache["gpu_output"] = gpu_output
-                    self.gpu_data_cache["proc_output"] = proc_output
-                    self.gpu_data_cache["timestamp"] = datetime.now()
+                    snapshot: dict[str, Any] = {
+                        "gpu_output": gpu_output,
+                        "proc_output": proc_output,
+                        "timestamp": datetime.now(),
+                    }
 
-                    full_output_counter += 1
-                    if full_output_counter >= 5:
-                        try:
-                            creationflags = (
-                                0x08000000 if platform.system() == "Windows" else 0
-                            )
-                            self.gpu_data_cache["full_output"] = (
-                                subprocess.check_output(
-                                    ["nvidia-smi"],
-                                    encoding="utf-8",
-                                    stderr=subprocess.STDOUT,
-                                    creationflags=creationflags,
-                                    timeout=5,
-                                )
-                            )
-                        except (subprocess.SubprocessError, OSError):
-                            pass
-                        full_output_counter = 0
+                    fetch_full_output = full_output_counter == 0
+                    full_output_counter = (full_output_counter + 1) % 5
+                    if fetch_full_output:
+                        snapshot["full_output"] = get_full_output(timeout=5)
+                    self._publish_gpu_data_snapshot(snapshot)
                 except (subprocess.SubprocessError, OSError, ValueError) as exc:
-                    self.gpu_data_cache["error"] = str(exc)
+                    self._publish_gpu_data_snapshot({"error": str(exc)})
 
                 # Sleep in increments or wait for manual refresh event
                 wait_sec = self.config["refresh_rate"] / 1000
@@ -1001,28 +1110,29 @@ class GPUMonitorApp:
         self.update_thread.start()
         self.update_gui()
 
-    def manual_refresh(self):
+    def manual_refresh(self) -> None:
         """Trigger immediate background fetch without spawning duplicate loops."""
         self.labels["status"].config(text="Refreshing metrics...")
         self.update_event.set()
 
-    def update_gui(self):
+    def update_gui(self) -> None:
         """Main thread GUI refresh function."""
         if self.stop_update:
             return
 
-        if "error" in self.gpu_data_cache:
-            self.labels["gpu"].config(text=f"Error: {self.gpu_data_cache['error']}")
+        data_snapshot = self._read_gpu_data_snapshot()
+        if "error" in data_snapshot:
+            self.labels["gpu"].config(text=f"Error: {data_snapshot['error']}")
             self.root.after(3000, self.update_gui)
             return
 
-        if "gpu_output" not in self.gpu_data_cache:
+        if "gpu_output" not in data_snapshot:
             self.root.after(300, self.update_gui)
             return
 
-        gpu_output = self.gpu_data_cache.get("gpu_output", "")
-        proc_output = self.gpu_data_cache.get("proc_output", "")
-        timestamp = self.gpu_data_cache.get("timestamp", datetime.now())
+        gpu_output = data_snapshot.get("gpu_output", "")
+        proc_output = data_snapshot.get("proc_output", "")
+        timestamp = data_snapshot.get("timestamp", datetime.now())
 
         if gpu_output.startswith("Error"):
             self.labels["gpu"].config(text=gpu_output)
@@ -1033,13 +1143,13 @@ class GPUMonitorApp:
             return
 
         # Clear any prior transient error once data is good
-        self.gpu_data_cache.pop("error", None)
-
         gpus = parse_gpu_metrics(gpu_output)
 
         # Build UUID -> Index mapping for processes
         uuid_to_idx = {g["uuid"]: g["index"] for g in gpus if g.get("uuid") is not None}
         processes = parse_processes(proc_output, uuid_to_index=uuid_to_idx)
+        if not gpus:
+            processes = []
         self.last_process_list = processes
 
         # Synchronize header label
@@ -1050,13 +1160,33 @@ class GPUMonitorApp:
                 self.labels["gpu"].config(
                     text=f"{gpus[0]['name']} (+{len(gpus) - 1} more)"
                 )
+        else:
+            self.labels["gpu"].config(text="No NVIDIA GPUs detected")
 
         # Synchronize GPU cards if indices changed
+        identity = tuple(
+            (gpu.get("index"), gpu.get("name"), gpu.get("uuid")) for gpu in gpus
+        )
         existing_indices = set(self.gpu_cards.keys())
         new_indices = {g["index"] for g in gpus}
-        if existing_indices != new_indices or not self.gpu_cards:
-            self.current_gpus = list(gpus)
+        identity_changed = identity != self.current_gpu_identity
+        self.current_gpus = [dict(gpu) for gpu in gpus]
+        self.current_gpu_identity = identity
+        if (
+            identity_changed
+            or existing_indices != new_indices
+            or (gpus and not self.gpu_cards)
+        ):
             self.rebuild_gpu_cards()
+
+        if not gpus:
+            self.refresh_process_table(processes)
+            time_str = timestamp.strftime("%H:%M:%S")
+            self.labels["status"].config(
+                text=f"No NVIDIA GPUs detected · Last checked {time_str}"
+            )
+            self.root.after(self.config["refresh_rate"], self.update_gui)
+            return
 
         # Update metrics for each individual GPU card
         for gpu in gpus:
@@ -1166,15 +1296,9 @@ class GPUMonitorApp:
                 text=tot_p_str, foreground=color_for_power(tot_draw, tot_cap)
             )
 
-        # Record history from primary GPU (or peak/avg)
+        # Record one history row for each distinct GPU query result.
         primary_gpu = gpus[0] if gpus else {}
-        self.history_data["time"].append(timestamp.strftime("%H:%M:%S"))
-        self.history_data["utilization"].append(primary_gpu.get("utilization") or 0)
-        self.history_data["temperature"].append(primary_gpu.get("temperature") or 0)
-        self.history_data["power"].append(primary_gpu.get("power_draw") or 0)
-        p_used = primary_gpu.get("mem_used") or 0
-        p_total = primary_gpu.get("mem_total") or 1
-        self.history_data["memory"].append((p_used / p_total) * 100 if p_total else 0)
+        self._record_history_sample(timestamp, primary_gpu)
 
         self.check_alerts(gpus)
         self.refresh_process_table(processes)
@@ -1183,13 +1307,11 @@ class GPUMonitorApp:
         if (
             "full_output_text" in self.labels
             and self.labels["full_output_text"].winfo_viewable()
-            and "full_output" in self.gpu_data_cache
+            and "full_output" in data_snapshot
         ):
             self.labels["full_output_text"].config(state="normal")
             self.labels["full_output_text"].delete("1.0", tk.END)
-            self.labels["full_output_text"].insert(
-                "1.0", self.gpu_data_cache["full_output"]
-            )
+            self.labels["full_output_text"].insert("1.0", data_snapshot["full_output"])
             self.labels["full_output_text"].config(state="disabled")
 
         rate_sec = self.config["refresh_rate"] / 1000
@@ -1205,12 +1327,62 @@ class GPUMonitorApp:
 
         self.root.after(self.config["refresh_rate"], self.update_gui)
 
-    def on_closing(self):
+    def _record_history_sample(self, timestamp: datetime, gpu: dict[str, Any]) -> bool:
+        """Append a history sample once, preserving unsupported values as gaps."""
+        if timestamp == self.last_history_timestamp:
+            return False
+
+        self.history_data["time"].append(timestamp.strftime("%H:%M:%S"))
+        self.history_data["utilization"].append(gpu.get("utilization"))
+        self.history_data["temperature"].append(gpu.get("temperature"))
+        self.history_data["power"].append(gpu.get("power_draw"))
+
+        mem_used = gpu.get("mem_used")
+        mem_total = gpu.get("mem_total")
+        memory_percent = (
+            (mem_used / mem_total) * 100
+            if mem_used is not None and mem_total is not None and mem_total > 0
+            else None
+        )
+        self.history_data["memory"].append(memory_percent)
+        self.last_history_timestamp = timestamp
+        return True
+
+    def _poll_tray_events(self) -> None:
+        """Apply tray requests on Tk's main thread."""
+        self._tray_event_after_id = None
+        if self.stop_update:
+            return
+
+        while True:
+            try:
+                event = self.tray_event_queue.get_nowait()
+            except queue.Empty:
+                break
+            if event == "show":
+                self.root.deiconify()
+                self.root.lift()
+            elif event == "quit":
+                self.on_closing()
+                return
+
+        if not self.stop_update:
+            self._tray_event_after_id = self.root.after(50, self._poll_tray_events)
+
+    def on_closing(self) -> None:
+        if self.stop_update:
+            return
         self.stop_update = True
         self.update_event.set()
+        if self._tray_event_after_id is not None:
+            try:
+                self.root.after_cancel(self._tray_event_after_id)
+            except tk.TclError:
+                pass
+            self._tray_event_after_id = None
 
         geometry = self.root.geometry()
-        match = re.match(r"(\d+)x(\d+)\+(\d+)\+(\d+)", geometry)
+        match = re.match(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)$", geometry)
         if match:
             self.config["window_width"] = int(match.group(1))
             self.config["window_height"] = int(match.group(2))
@@ -1229,7 +1401,7 @@ class GPUMonitorApp:
         self.root.destroy()
 
 
-def main():
+def main() -> None:
     root = tk.Tk()
     _app = GPUMonitorApp(root)
     root.mainloop()

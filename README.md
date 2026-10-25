@@ -18,7 +18,9 @@ This application provides a user-friendly GUI that displays key NVIDIA GPU infor
 - 💻 **Laptop & cloud resilience** - Defensive parsing for `[N/A]` and `[Not Supported]` fields (e.g. mobile GPU fans or power limits)
 - 📋 **Full nvidia-smi output** - Collapsible section showing complete nvidia-smi information
 - 🛡️ **Error handling** - Graceful handling of missing drivers, unsupported commands, or timeouts
-- 📈 **History graphs, tray icon, alerts and CSV/JSON export** - available when optional `matplotlib`, `pystray`/`pillow` and `plyer` packages are installed
+- 📈 **History graphs** - optional `matplotlib`; history tracks the first GPU returned by the driver
+- 🔔 **Tray icon and desktop alerts** - optional `pystray`/`pillow` and `plyer`, respectively
+- 💾 **CSV/JSON history export** - available with the standard library alone
 - 🌐 **Windows and Linux** - macOS is not supported: current Macs have no NVIDIA driver or `nvidia-smi`
 - 🪶 **Lightweight** - the core runs on the Python standard library alone; extras are optional (`pip install -r requirements.txt`)
 
@@ -56,7 +58,7 @@ nvidia-smi-tk/
 
 ### Software Requirements
 
-- Python 3.6 or higher
+- Python 3.10 or higher
 - Tkinter (usually included with Python installation)
 - NVIDIA drivers with `nvidia-smi` utility
 
@@ -69,6 +71,33 @@ python -m unittest discover -s tests -p "test_*.py" -v
 # Or with pytest if installed
 pytest tests/ -v
 ```
+
+The core starts without optional packages. For local development, create a
+virtual environment before installing test tools or extras:
+
+```bash
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# Linux: source .venv/bin/activate
+python -m pip install pytest==8.4.2 ruff==0.14.2
+python -m unittest discover -s tests -p "test_*.py" -v
+python -m pytest tests/ -v
+python -m compileall -q App.py config.py nvidia_smi.py ui tests
+```
+
+Power-limit tests mock privileged commands; they do not change real hardware
+settings. Live validation must identify the GPU, driver and OS separately from
+the automated suite. Desktop notifications, tray support and privileged power
+changes depend on the operating system and installed services.
+
+Configuration is stored in `~/.nvidia_smi_tk_config.json`. History is kept in
+memory for the latest 60 samples and can be exported from the File menu.
+GPU process information comes from the driver's compute-app query; Windows
+WDDM can report unavailable process memory, and this is not a complete operating
+system process list.
+
+See [the implementation audit](docs/implementation-audit.md) for the repaired
+failure paths, validation evidence and remaining platform checks.
 
 ## License
 

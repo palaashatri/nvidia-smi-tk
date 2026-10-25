@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import ctypes
+import base64
+import csv
+import math
+import os
 import platform
 import re
 import shutil
 import subprocess
+import tempfile
 import time
+from collections.abc import Callable
+from ctypes import wintypes
 from typing import Any
 
 COLOR_UTIL_WARN = 70
@@ -31,6 +38,8 @@ def parse_numeric(val: Any, default: Any = None, is_int: bool = False) -> Any:
         return default
     try:
         num = float(s)
+        if not math.isfinite(num):
+            return default
         return int(num) if is_int else num
     except (ValueError, TypeError):
         return default
@@ -45,35 +54,49 @@ def parse_gpu_metrics(output: str) -> list[dict[str, Any]]:
     - 9 columns: legacy metrics only (default index 0)
     """
     gpus: list[dict[str, Any]] = []
-    if not output or output.startswith("Error") or "No devices" in output:
+    if (
+        not output
+        or output.lstrip().lower().startswith("error")
+        or "no devices" in output.lower()
+    ):
         return gpus
 
-    lines = [line.strip() for line in output.strip().splitlines() if line.strip()]
-    for i, line in enumerate(lines):
-        if line.startswith(("#", "=")):
+    for raw_line in output.splitlines():
+        if not raw_line.strip():
             continue
-        parts = [p.strip() for p in line.split(",")]
+        try:
+            parts = next(csv.reader([raw_line], skipinitialspace=True, strict=True))
+        except (csv.Error, StopIteration):
+            continue
+        parts = [part.strip() for part in parts]
+        if not parts or parts[0].startswith(("#", "=")):
+            continue
+
         gpu_uuid: str | None = None
 
         if len(parts) >= 12:
             raw_index = parts[0]
             try:
                 gpu_index = int(raw_index)
-            except ValueError:
-                gpu_index = i
+            except (TypeError, ValueError):
+                continue
             gpu_uuid = parts[1]
+            if gpu_index < 0 or not gpu_uuid.upper().startswith(("GPU-", "MIG-")):
+                continue
             gpu_name = ", ".join(parts[2:-9]).strip() or f"GPU {gpu_index}"
             metric_parts = parts[-9:]
         elif len(parts) >= 11:
             raw_index = parts[0]
             try:
                 gpu_index = int(raw_index)
-            except ValueError:
-                gpu_index = i
+            except (TypeError, ValueError):
+                continue
+            if gpu_index < 0:
+                continue
             gpu_name = ", ".join(parts[1:-9]).strip() or f"GPU {gpu_index}"
             metric_parts = parts[-9:]
         elif len(parts) >= 9:
-            gpu_index = i
+            gpu_index = len(gpus)
             gpu_name = f"GPU {gpu_index}"
             metric_parts = parts[-9:]
         else:
@@ -105,24 +128,38 @@ def parse_processes(
 
     Maps GPU UUIDs to numerical GPU indices when uuid_to_index is provided.
     """
-    processes = []
-    if not proc_output or proc_output.startswith("Error"):
+    processes: list[dict[str, str]] = []
+    if not proc_output or proc_output.lstrip().lower().startswith("error"):
         return processes
 
     for raw_line in proc_output.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+        if not raw_line.strip():
             continue
-        parts = [x.strip() for x in line.split(",")]
+        try:
+            parts = next(csv.reader([raw_line], skipinitialspace=True, strict=True))
+        except (csv.Error, StopIteration):
+            continue
+        parts = [part.strip() for part in parts]
+        if not parts or parts[0].startswith("#"):
+            continue
         if len(parts) >= 4:
             # gpu_id (uuid or index), pid, name, mem
-            raw_gpu, pid, name, mem = parts[0], parts[1], parts[2], parts[3]
-            gpu_str = "0"
+            raw_gpu, pid, mem = parts[0], parts[1], parts[-1]
+            name = ", ".join(parts[2:-1]).strip()
+            gpu_str = "?"
             if uuid_to_index and raw_gpu in uuid_to_index:
-                gpu_str = str(uuid_to_index[raw_gpu])
+                mapped_index = uuid_to_index[raw_gpu]
+                if (
+                    isinstance(mapped_index, int)
+                    and not isinstance(mapped_index, bool)
+                    and mapped_index >= 0
+                ):
+                    gpu_str = str(mapped_index)
             elif raw_gpu.isdigit():
                 gpu_str = raw_gpu
 
+            if not pid.isdigit() or not name:
+                continue
             mem_val = mem if mem and "n/a" not in mem.lower() else "N/A"
             processes.append(
                 {
@@ -132,12 +169,15 @@ def parse_processes(
                     "mem": mem_val,
                 }
             )
-        elif len(parts) == 3:
-            pid, name, mem = parts[0], parts[1], parts[2]
+        elif len(parts) >= 3:
+            pid, mem = parts[0], parts[-1]
+            name = ", ".join(parts[1:-1]).strip()
+            if not pid.isdigit() or not name:
+                continue
             mem_val = mem if mem and "n/a" not in mem.lower() else "N/A"
             processes.append(
                 {
-                    "gpu": "0",
+                    "gpu": "?",
                     "pid": pid,
                     "name": name,
                     "mem": mem_val,
@@ -151,7 +191,11 @@ def parse_power_limits(
     smi_output: str, gpu_index: int | None = None
 ) -> tuple[float | None, float | None, float | None]:
     """Parse power limits (current, min, max) from nvidia-smi POWER output."""
-    if not smi_output or "No devices" in smi_output:
+    if not smi_output or "no devices" in smi_output.lower():
+        return None, None, None
+    if gpu_index is not None and (
+        isinstance(gpu_index, bool) or not isinstance(gpu_index, int) or gpu_index < 0
+    ):
         return None, None, None
 
     cur: float | None = None
@@ -166,6 +210,8 @@ def parse_power_limits(
         ]
         if 0 <= gpu_index < len(gpu_sections):
             target_section = gpu_sections[gpu_index]
+        else:
+            return None, None, None
 
     cur_pat = re.compile(
         r"^(?:Current\s+Power\s+Limit|Power\s+Limit|Enforced\s+Power\s+Limit)\s*:\s*([\d\.]+)\s*W",
@@ -181,25 +227,18 @@ def parse_power_limits(
         m_max = max_pat.match(line)
 
         if m_cur and cur is None:
-            try:
-                cur = float(m_cur.group(1))
-            except ValueError:
-                pass
+            cur = parse_numeric(m_cur.group(1))
         elif m_min and min_ is None:
-            try:
-                min_ = float(m_min.group(1))
-            except ValueError:
-                pass
+            min_ = parse_numeric(m_min.group(1))
         elif m_max and max_ is None:
-            try:
-                max_ = float(m_max.group(1))
-            except ValueError:
-                pass
+            max_ = parse_numeric(m_max.group(1))
 
     return cur, min_, max_
 
 
-def run_with_retry(func, retries=3, delay=0.5):
+def run_with_retry(
+    func: Callable[[], Any], retries: int = 3, delay: float = 0.5
+) -> Any:
     """Execute a function with retry logic."""
     for i in range(retries):
         try:
@@ -260,8 +299,21 @@ def get_nvidia_smi_output(timeout: int = 5) -> tuple[str, str]:
         )
     except subprocess.TimeoutExpired:
         return "Error: nvidia-smi command timed out.", ""
+    except subprocess.CalledProcessError as exc:
+        diagnostic = _subprocess_error_output(exc)
+        if diagnostic:
+            return f"Error: nvidia-smi failed.\n{diagnostic}", ""
+        return f"Error: {exc}", ""
     except (subprocess.SubprocessError, OSError, ValueError) as exc:
         return f"Error: {exc}", ""
+
+
+def _subprocess_error_output(error: subprocess.CalledProcessError) -> str:
+    """Return captured subprocess output as readable diagnostic text."""
+    output = error.output or error.stdout or error.stderr
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace").strip()
+    return str(output).strip() if output else ""
 
 
 def get_gpu_info(timeout: int = 5) -> str:
@@ -297,10 +349,47 @@ def get_gpu_info(timeout: int = 5) -> str:
         return "Unknown GPU"
 
 
-def get_power_limits(
+def get_full_output(timeout: int = 5) -> str:
+    """Return bounded raw nvidia-smi output or a readable diagnostic."""
+    creationflags = 0x08000000 if platform.system() == "Windows" else 0
+    try:
+        return subprocess.check_output(
+            ["nvidia-smi"],
+            encoding="utf-8",
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return "Error: nvidia-smi not found. Ensure NVIDIA drivers are installed."
+    except subprocess.TimeoutExpired:
+        return "Error: nvidia-smi command timed out."
+    except subprocess.CalledProcessError as exc:
+        diagnostic = _subprocess_error_output(exc)
+        if diagnostic:
+            return f"Error: nvidia-smi failed.\n{diagnostic}"
+        return f"Error: {exc}"
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+        return f"Error: {exc}"
+
+
+class PowerLimitQueryError(RuntimeError):
+    """A power-limit query failed before it could produce a parsed result."""
+
+
+def get_power_limits_checked(
     gpu_index: int | None = None, timeout: int = 5
 ) -> tuple[float | None, float | None, float | None]:
-    """Retrieve current, minimum, and maximum power limits in Watts."""
+    """Query power limits, raising with the driver diagnostic on failure."""
+    if gpu_index is not None and (
+        isinstance(gpu_index, bool) or not isinstance(gpu_index, int) or gpu_index < 0
+    ):
+        raise PowerLimitQueryError("GPU index must be a non-negative integer.")
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        raise PowerLimitQueryError(
+            "Timeout must be a positive integer number of seconds."
+        )
+
     creationflags = 0x08000000 if platform.system() == "Windows" else 0
     try:
 
@@ -316,11 +405,341 @@ def get_power_limits(
                 creationflags=creationflags,
                 timeout=timeout,
             )
-            return parse_power_limits(smi, gpu_index=gpu_index)
+            # The command already filters output to gpu_index; parsing it as a
+            # multi-device report would mistake a sparse index (for example 9)
+            # for an ordinal position in the one returned section.
+            return parse_power_limits(smi)
 
         return run_with_retry(fetch)
-    except (subprocess.SubprocessError, OSError, ValueError):
+    except FileNotFoundError as exc:
+        raise PowerLimitQueryError(
+            "nvidia-smi not found. Ensure NVIDIA drivers are installed."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise PowerLimitQueryError("nvidia-smi power-limit query timed out.") from exc
+    except subprocess.CalledProcessError as exc:
+        diagnostic = _subprocess_error_output(exc)
+        message = (
+            f"nvidia-smi power-limit query failed.\n{diagnostic}"
+            if diagnostic
+            else f"nvidia-smi power-limit query failed: {exc}"
+        )
+        raise PowerLimitQueryError(message) from exc
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+        raise PowerLimitQueryError(
+            f"nvidia-smi power-limit query failed: {exc}"
+        ) from exc
+
+
+def get_power_limits(
+    gpu_index: int | None = None, timeout: int = 5
+) -> tuple[float | None, float | None, float | None]:
+    """Compatibility wrapper returning unavailable values when a query fails."""
+    try:
+        return get_power_limits_checked(gpu_index=gpu_index, timeout=timeout)
+    except PowerLimitQueryError:
         return None, None, None
+
+
+class _ShellExecuteInfo(ctypes.Structure):
+    """ctypes representation of the Windows SHELLEXECUTEINFO structure."""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("fMask", wintypes.ULONG),
+        ("hwnd", wintypes.HWND),
+        ("lpVerb", wintypes.LPCWSTR),
+        ("lpFile", wintypes.LPCWSTR),
+        ("lpParameters", wintypes.LPCWSTR),
+        ("lpDirectory", wintypes.LPCWSTR),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", wintypes.HINSTANCE),
+        ("lpIDList", ctypes.c_void_p),
+        ("lpClass", wintypes.LPCWSTR),
+        ("hkeyClass", wintypes.HKEY),
+        ("dwHotKey", wintypes.DWORD),
+        ("hIcon", wintypes.HANDLE),
+        ("hProcess", wintypes.HANDLE),
+    ]
+
+
+def _set_win_api_signature(function: Any, argtypes: list[Any], restype: Any) -> None:
+    """Assign Win32 prototypes when using real ctypes function pointers."""
+    try:
+        function.argtypes = argtypes
+        function.restype = restype
+    except AttributeError:
+        # Python fakes in tests do not expose ctypes function metadata.
+        pass
+
+
+def _run_windows_elevated(
+    executable: str, arguments: list[str], timeout: int
+) -> tuple[int | None, str | None]:
+    """Run a Windows command through UAC and wait for its exit status."""
+    if platform.system() != "Windows":
+        return None, "Windows elevation is unavailable on this platform."
+
+    process_handle: Any = None
+    com_initialized = False
+    try:
+        shell32 = ctypes.windll.shell32
+        kernel32 = ctypes.windll.kernel32
+        ole32 = ctypes.windll.ole32
+
+        _set_win_api_signature(
+            shell32.ShellExecuteExW,
+            [ctypes.POINTER(_ShellExecuteInfo)],
+            wintypes.BOOL,
+        )
+        _set_win_api_signature(
+            kernel32.WaitForSingleObject,
+            [wintypes.HANDLE, wintypes.DWORD],
+            wintypes.DWORD,
+        )
+        _set_win_api_signature(
+            kernel32.GetExitCodeProcess,
+            [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)],
+            wintypes.BOOL,
+        )
+        _set_win_api_signature(kernel32.GetLastError, [], wintypes.DWORD)
+        _set_win_api_signature(kernel32.CloseHandle, [wintypes.HANDLE], wintypes.BOOL)
+        _set_win_api_signature(
+            ole32.CoInitializeEx, [ctypes.c_void_p, wintypes.DWORD], ctypes.c_long
+        )
+        _set_win_api_signature(ole32.CoUninitialize, [], None)
+
+        # ShellExecuteEx can use COM internally. RPC_E_CHANGED_MODE means the
+        # current worker already initialized COM with a different apartment.
+        com_result = ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+        if com_result < 0 and com_result != -2147417850:  # RPC_E_CHANGED_MODE
+            return None, f"Could not initialize Windows COM (HRESULT {com_result})."
+        com_initialized = com_result >= 0
+
+        info = _ShellExecuteInfo()
+        info.cbSize = ctypes.sizeof(info)
+        info.fMask = 0x00000040  # SEE_MASK_NOCLOSEPROCESS
+        info.lpVerb = "runas"
+        info.lpFile = executable
+        info.lpParameters = subprocess.list2cmdline(arguments)
+        info.nShow = 0
+
+        if not shell32.ShellExecuteExW(ctypes.byref(info)):
+            error_code = kernel32.GetLastError()
+            if error_code == 1223:  # ERROR_CANCELLED
+                return None, "Administrator elevation was cancelled."
+            return (
+                None,
+                f"Could not start elevated nvidia-smi (Windows error {error_code}).",
+            )
+
+        process_handle = info.hProcess
+        if not process_handle:
+            return (
+                None,
+                "Windows did not return a process handle; command completion is unconfirmed.",
+            )
+
+        wait_result = kernel32.WaitForSingleObject(process_handle, timeout * 1000)
+        if wait_result == 258:  # WAIT_TIMEOUT
+            return (
+                None,
+                "Elevated process timed out; command completion is unconfirmed.",
+            )
+        if wait_result != 0:  # WAIT_OBJECT_0
+            error_code = kernel32.GetLastError()
+            return (
+                None,
+                f"Could not wait for elevated process (Windows error {error_code}); "
+                "command completion is unconfirmed.",
+            )
+
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code)):
+            error_code = kernel32.GetLastError()
+            return (
+                None,
+                f"Could not read elevated process exit status (Windows error {error_code}); "
+                "command completion is unconfirmed.",
+            )
+        return int(exit_code.value), None
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        return None, f"Windows elevation failed: {exc}"
+    finally:
+        if process_handle:
+            try:
+                ctypes.windll.kernel32.CloseHandle(process_handle)
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+        if com_initialized:
+            try:
+                ctypes.windll.ole32.CoUninitialize()
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+
+
+def _get_windows_powershell_path() -> str | None:
+    """Resolve Windows PowerShell beneath the Windows system directory."""
+    if platform.system() != "Windows":
+        return None
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        _set_win_api_signature(
+            kernel32.GetSystemDirectoryW,
+            [wintypes.LPWSTR, wintypes.UINT],
+            wintypes.UINT,
+        )
+        system_directory = ctypes.create_unicode_buffer(32768)
+        length = kernel32.GetSystemDirectoryW(system_directory, len(system_directory))
+        if not length or length >= len(system_directory):
+            return None
+        candidate = os.path.join(
+            system_directory.value,
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe",
+        )
+        return candidate if os.path.isfile(candidate) else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _powershell_single_quoted(value: str) -> str:
+    """Quote one literal for use as a PowerShell single-quoted string."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _build_windows_capture_script(
+    executable: str, arguments: list[str], timeout: int, output_path: str
+) -> str:
+    """Build a fixed PowerShell process wrapper with redirected output streams."""
+    argument_string = subprocess.list2cmdline(arguments)
+    executable_literal = _powershell_single_quoted(executable)
+    argument_literal = _powershell_single_quoted(argument_string)
+    output_literal = _powershell_single_quoted(output_path)
+    timeout_ms = timeout * 1000
+    return f"""$exePath = {executable_literal}
+$nativeArguments = {argument_literal}
+$logPath = {output_literal}
+$timeoutMilliseconds = {timeout_ms}
+$process = $null
+$stdoutTask = $null
+$stderrTask = $null
+try {{
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $exePath
+    $startInfo.Arguments = $nativeArguments
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {{ throw 'Could not start nvidia-smi.' }}
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+
+    if (-not $process.WaitForExit($timeoutMilliseconds)) {{
+        $killDiagnostic = ''
+        try {{ $process.Kill() }} catch {{ $killDiagnostic = $_.Exception.Message }}
+        [void]$process.WaitForExit(5000)
+        [void]$stdoutTask.Wait(5000)
+        [void]$stderrTask.Wait(5000)
+        $stdout = if ($stdoutTask.IsCompleted) {{ $stdoutTask.Result }} else {{ '[stdout capture incomplete]' }}
+        $stderr = if ($stderrTask.IsCompleted) {{ $stderrTask.Result }} else {{ '[stderr capture incomplete]' }}
+        $diagnostic = "nvidia-smi timed out after $timeoutMilliseconds ms; command completion is unconfirmed.`r`nstdout:`r`n$stdout`r`nstderr:`r`n$stderr"
+        if ($killDiagnostic) {{ $diagnostic += "`r`nCould not stop nvidia-smi: $killDiagnostic" }}
+        [System.IO.File]::WriteAllText($logPath, $diagnostic, [System.Text.UTF8Encoding]::new($false))
+        exit 124
+    }}
+
+    $process.WaitForExit()
+    [void]$stdoutTask.Wait(5000)
+    [void]$stderrTask.Wait(5000)
+    $stdout = if ($stdoutTask.IsCompleted) {{ $stdoutTask.Result }} else {{ '[stdout capture incomplete]' }}
+    $stderr = if ($stderrTask.IsCompleted) {{ $stderrTask.Result }} else {{ '[stderr capture incomplete]' }}
+    $diagnostic = "stdout:`r`n$stdout`r`nstderr:`r`n$stderr"
+    [System.IO.File]::WriteAllText($logPath, $diagnostic, [System.Text.UTF8Encoding]::new($false))
+    exit $process.ExitCode
+}} catch {{
+    $diagnostic = "Could not run elevated nvidia-smi: " + ($_ | Out-String)
+    try {{ [System.IO.File]::WriteAllText($logPath, $diagnostic, [System.Text.UTF8Encoding]::new($false)) }} catch {{}}
+    exit 1
+}} finally {{
+    if ($process) {{ $process.Dispose() }}
+}}
+"""
+
+
+def _run_windows_elevated_with_capture(
+    executable: str, arguments: list[str], timeout: int
+) -> tuple[int | None, str, str | None]:
+    """Elevate nvidia-smi, return its native output, and clean temporary logs."""
+    powershell_path = _get_windows_powershell_path()
+    if not powershell_path:
+        return (
+            None,
+            "",
+            "Trusted Windows PowerShell was not found in the system directory.",
+        )
+    if not os.path.isabs(powershell_path):
+        return None, "", "Windows PowerShell path is not absolute."
+    if (
+        len(arguments) != 4
+        or arguments[0] != "-i"
+        or not arguments[1].isdigit()
+        or arguments[2] != "-pl"
+        or not arguments[3].isdigit()
+        or int(arguments[3]) <= 0
+    ):
+        return None, "Invalid GPU power-limit command arguments.", None
+
+    try:
+        temporary_directory = tempfile.mkdtemp(prefix="nvidia_smi_tk_power_")
+    except OSError as exc:
+        return None, "", f"Could not create temporary output capture: {exc}"
+
+    output_path = os.path.join(temporary_directory, "nvidia-smi-output.txt")
+    keep_temporary_directory = False
+    try:
+        script = _build_windows_capture_script(
+            executable, arguments, timeout, output_path
+        )
+        encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        powershell_arguments = [
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            encoded_script,
+        ]
+        exit_code, elevation_error = _run_windows_elevated(
+            powershell_path, powershell_arguments, timeout + 10
+        )
+        try:
+            with open(output_path, "r", encoding="utf-8", errors="replace") as log:
+                diagnostic = log.read().strip()
+        except FileNotFoundError:
+            diagnostic = ""
+        except OSError as exc:
+            diagnostic = f"Could not read elevated nvidia-smi output: {exc}"
+
+        if elevation_error and any(
+            marker in elevation_error.lower()
+            for marker in ("unconfirmed", "timed out", "could not wait")
+        ):
+            keep_temporary_directory = True
+            elevation_error = (
+                f"{elevation_error}\n"
+                f"Temporary capture retained at {output_path} because the elevated "
+                "process may still be writing."
+            )
+        return exit_code, diagnostic, elevation_error
+    except (OSError, TypeError, ValueError) as exc:
+        return None, "", f"Could not prepare elevated nvidia-smi capture: {exc}"
+    finally:
+        if not keep_temporary_directory:
+            shutil.rmtree(temporary_directory, ignore_errors=True)
 
 
 def set_power_limit(
@@ -331,90 +750,172 @@ def set_power_limit(
     timeout: int = 15,
 ) -> tuple[bool, str]:
     """Set the GPU power limit with range validation and elevation support."""
-    if (
-        min_limit is not None
-        and max_limit is not None
-        and (new_limit < min_limit or new_limit > max_limit)
-    ):
-        msg = f"Value must be between {min_limit:.1f} and {max_limit:.1f} W"
-        return False, msg
+    if isinstance(new_limit, bool) or not isinstance(new_limit, (int, float)):
+        return False, "Power limit must be a finite positive number."
+    if not math.isfinite(float(new_limit)) or new_limit <= 0:
+        return False, "Power limit must be a finite positive number."
+    if isinstance(gpu_index, bool) or not isinstance(gpu_index, int) or gpu_index < 0:
+        return False, "GPU index must be a non-negative integer."
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        return False, "Timeout must be a positive integer number of seconds."
 
-    val_str = str(round(new_limit))
-    creationflags = 0x08000000 if platform.system() == "Windows" else 0
+    new_limit = float(new_limit)
+    if min_limit is None or max_limit is None:
+        try:
+            _current, queried_min, queried_max = get_power_limits_checked(
+                gpu_index=gpu_index
+            )
+        except PowerLimitQueryError as exc:
+            return False, f"Could not query GPU power-limit range: {exc}"
+        if min_limit is None:
+            min_limit = queried_min
+        if max_limit is None:
+            max_limit = queried_max
+
+    if (
+        isinstance(min_limit, bool)
+        or isinstance(max_limit, bool)
+        or not isinstance(min_limit, (int, float))
+        or not isinstance(max_limit, (int, float))
+        or not math.isfinite(float(min_limit))
+        or not math.isfinite(float(max_limit))
+        or min_limit <= 0
+        or max_limit < min_limit
+    ):
+        return False, "Could not verify a valid GPU power-limit range."
+
+    min_limit = float(min_limit)
+    max_limit = float(max_limit)
+    command_limit = round(new_limit)
+    if (
+        new_limit < min_limit
+        or new_limit > max_limit
+        or command_limit < min_limit
+        or command_limit > max_limit
+    ):
+        return False, f"Value must be between {min_limit:.1f} and {max_limit:.1f} W"
+    if command_limit <= 0:
+        return False, "Power limit must be a finite positive number."
+
+    executable = shutil.which("nvidia-smi")
+    if not executable:
+        return False, "nvidia-smi was not found on PATH."
+
+    arguments = ["-i", str(gpu_index), "-pl", str(command_limit)]
+    command = [executable, *arguments]
     system = platform.system()
+    creationflags = 0x08000000 if system == "Windows" else 0
 
     if system == "Windows":
-        cmd = ["nvidia-smi", "-i", str(gpu_index), "-pl", val_str]
         try:
-            res = subprocess.run(
-                cmd,
+            result = subprocess.run(
+                command,
                 capture_output=True,
                 text=True,
                 creationflags=creationflags,
                 timeout=timeout,
                 check=False,
             )
-            if res.returncode == 0:
-                return True, res.stdout.strip()
+            if result.returncode == 0:
+                return True, result.stdout.strip() or "Power limit updated."
 
-            err_out = (res.stderr or res.stdout).strip()
-            # If standard run fails due to permissions, trigger Windows UAC elevation
-            if "permission" in err_out.lower() or "administrator" in err_out.lower():
-                if hasattr(ctypes, "windll") and hasattr(ctypes.windll, "shell32"):
-                    params = f"-i {gpu_index} -pl {val_str}"
-                    ret = ctypes.windll.shell32.ShellExecuteW(
-                        None, "runas", "nvidia-smi", params, None, 0
-                    )
-                    if ret > 32:
-                        return (
-                            True,
-                            "Elevation prompt requested. Power limit update submitted.",
-                        )
+            error_output = "\n".join(
+                value.strip()
+                for value in (result.stderr or "", result.stdout or "")
+                if value.strip()
+            )
+            if (
+                "permission" in error_output.lower()
+                or "administrator" in error_output.lower()
+            ):
+                exit_code, elevated_output, elevation_error = (
+                    _run_windows_elevated_with_capture(executable, arguments, timeout)
+                )
+                diagnostics = "\n".join(
+                    part.strip()
+                    for part in (elevated_output, error_output)
+                    if part and part.strip()
+                )
+                if elevation_error:
+                    return False, f"{elevation_error}\n{diagnostics}".strip()
+                if exit_code is None:
                     return (
                         False,
-                        "Administrator elevation was declined or failed.",
+                        "Elevated command completion is unconfirmed.\n"
+                        f"{diagnostics}".strip(),
                     )
-                return False, f"Administrator privileges required. {err_out}"
-            return False, err_out or "Failed to set power limit."
+                if exit_code != 0:
+                    return (
+                        False,
+                        f"Elevated nvidia-smi exited with code {exit_code}.\n"
+                        f"{diagnostics}",
+                    )
+                try:
+                    current_limit, _min_limit, _max_limit = get_power_limits_checked(
+                        gpu_index=gpu_index, timeout=timeout
+                    )
+                except PowerLimitQueryError as exc:
+                    return (
+                        False,
+                        "Elevated command exited successfully, but power-limit "
+                        f"readback failed: {exc}; command outcome is unconfirmed.\n"
+                        f"{diagnostics}",
+                    )
+                if current_limit is None or not math.isclose(
+                    current_limit, command_limit, rel_tol=0.0, abs_tol=0.01
+                ):
+                    actual = (
+                        "unavailable"
+                        if current_limit is None
+                        else f"{current_limit:.1f} W"
+                    )
+                    return (
+                        False,
+                        "Elevated command exited successfully, but command outcome "
+                        "is unconfirmed; the current limit "
+                        f"could not be confirmed as {command_limit} W (reported {actual}).\n"
+                        f"{diagnostics}",
+                    )
+                return (
+                    True,
+                    f"Power limit updated to {current_limit:.1f} W.\n{diagnostics}".strip(),
+                )
+            return False, error_output or "Failed to set power limit."
         except subprocess.TimeoutExpired:
             return False, "nvidia-smi timed out."
         except (subprocess.SubprocessError, OSError, ValueError) as exc:
             return False, str(exc)
 
-    # Linux / Unix: Check pkexec or fallback to sudo -n
     pkexec_path = shutil.which("pkexec")
     if pkexec_path:
-        cmd = [pkexec_path, "nvidia-smi", "-i", str(gpu_index), "-pl", val_str]
+        command = [pkexec_path, executable, *arguments]
     else:
-        cmd = [
-            "sudo",
-            "-n",
-            "nvidia-smi",
-            "-i",
-            str(gpu_index),
-            "-pl",
-            val_str,
-        ]
+        command = ["sudo", "-n", executable, *arguments]
 
     try:
-        res = subprocess.run(
-            cmd,
+        result = subprocess.run(
+            command,
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
         )
-        if res.returncode == 0:
-            return True, res.stdout.strip()
-        err_out = (res.stderr or res.stdout).strip()
+        if result.returncode == 0:
+            return True, result.stdout.strip() or "Power limit updated."
+        error_output = "\n".join(
+            value.strip()
+            for value in (result.stderr or "", result.stdout or "")
+            if value.strip()
+        )
         if not pkexec_path and (
-            "password" in err_out.lower() or "sudo" in err_out.lower()
+            "password" in error_output.lower() or "sudo" in error_output.lower()
         ):
             return (
                 False,
-                "Elevation required. Install pkexec (polkit) or run with sudo.",
+                "Elevation required. Install pkexec (polkit) or run with sudo.\n"
+                f"{error_output}",
             )
-        return False, err_out or "Failed to set power limit."
+        return False, error_output or "Failed to set power limit."
     except subprocess.TimeoutExpired:
         return False, "Command timed out."
     except (subprocess.SubprocessError, OSError, ValueError) as exc:

@@ -16,16 +16,19 @@ try:
     from matplotlib.figure import Figure
 
     MATPLOTLIB_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError, RuntimeError, ValueError):
+    FigureCanvasTkAgg = None
+    Figure = None
     MATPLOTLIB_AVAILABLE = False
 
 
 class HistoryGraphWindow:
     """Toplevel window for plotting real-time GPU history graphs."""
 
-    def __init__(self, parent_app: Any):
+    def __init__(self, parent_app: Any) -> None:
         self.parent = parent_app
         self.window: tk.Toplevel | None = None
+        self._after_id: str | None = None
 
     def show(self) -> None:
         if not MATPLOTLIB_AVAILABLE:
@@ -58,7 +61,8 @@ class HistoryGraphWindow:
 
         history_data = self.parent.history_data
 
-        def update_graphs():
+        def update_graphs() -> None:
+            self._after_id = None
             if not self.window or not tk.Toplevel.winfo_exists(self.window):
                 return
 
@@ -96,11 +100,17 @@ class HistoryGraphWindow:
                 fig.tight_layout()
                 canvas.draw()
 
-            self.parent.root.after(2000, update_graphs)
+            self._after_id = self.parent.root.after(2000, update_graphs)
 
         update_graphs()
 
-        def on_close():
+        def on_close() -> None:
+            if self._after_id is not None:
+                try:
+                    self.parent.root.after_cancel(self._after_id)
+                except tk.TclError:
+                    pass
+                self._after_id = None
             if self.window:
                 self.window.destroy()
                 self.window = None
