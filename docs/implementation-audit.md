@@ -48,9 +48,9 @@ on Windows NT 10.0.26300.0, NVIDIA GeForce RTX 3080, driver 621.01:
 
 | Check | Command or exercised path | Actual result |
 | --- | --- | --- |
-| unittest with extras | `.venv/Scripts/python.exe -m unittest discover -s tests -p "test_*.py" -v` | 68 tests, OK |
-| unittest without extras | Bundled stdlib interpreter, same unittest command | 68 tests, OK |
-| pytest | `.venv/Scripts/python.exe -m pytest tests/ -q -rs` | 84 passed |
+| unittest with extras | `.venv/Scripts/python.exe -m unittest discover -s tests -p "test_*.py" -v` | 69 tests, OK |
+| unittest without extras | Bundled stdlib interpreter, same unittest command | 69 tests, OK |
+| pytest | `.venv/Scripts/python.exe -m pytest tests/ -q -rs` | 85 passed |
 | Syntax | `.venv/Scripts/python.exe -m compileall -q App.py config.py nvidia_smi.py ui tests` | Exit 0 |
 | Ruff | `.venv/Scripts/python.exe -m ruff check App.py config.py nvidia_smi.py ui tests` | All checks passed |
 | Formatting | `.venv/Scripts/python.exe -m ruff format --check App.py config.py nvidia_smi.py ui tests` | 13 files already formatted |
@@ -78,6 +78,10 @@ query and elevated-command diagnostics, and disabling Apply on an unconfirmed
 outcome. PowerShell itself is resolved from the Windows system directory;
 the monitored NVIDIA CLI retains the documented executable-on-PATH convention.
 
-The CI changes still require execution on GitHub Actions. Local workflow
-execution and actionlint were not available. Test logs and the live smoke
-script are retained locally under ignored `build/`.
+GitHub Actions results are linked from the implementation PR. Its first run
+passed both Windows test jobs and exposed a mocked Windows-path assumption in
+one Linux test; the fixture was corrected to use a host-absolute mock path.
+Headless Linux skips the real-display tests. Local workflow execution and
+actionlint were not available. Test logs and the live smoke script are retained
+locally under ignored `build/`. The external Snyk check reported account test
+quota exhaustion; it did not produce a security-analysis result.

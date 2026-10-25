@@ -209,7 +209,7 @@ class PowerLimitRegressionTests(unittest.TestCase):
 
     def test_windows_elevated_capture_reads_stdout_and_stderr_log(self) -> None:
         executable = "C:\\Program Files\\Vendor\\O'Hare\\nvidia-smi.exe"
-        powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+        powershell = str(Path(tempfile.gettempdir()) / "powershell.exe")
         seen: dict[str, str] = {}
 
         def fake_elevated_run(
@@ -254,6 +254,25 @@ class PowerLimitRegressionTests(unittest.TestCase):
         self.assertIn("stderr: elevated permission denied", output)
         self.assertIsNone(error)
         self.assertFalse(Path(seen["output_path"]).exists())
+
+    def test_windows_elevated_capture_rejects_relative_powershell_path(self) -> None:
+        with (
+            patch.object(nvidia_smi.platform, "system", return_value="Windows"),
+            patch.object(
+                nvidia_smi,
+                "_get_windows_powershell_path",
+                return_value="powershell.exe",
+            ),
+            patch.object(nvidia_smi, "_run_windows_elevated") as elevate,
+        ):
+            exit_code, output, error = nvidia_smi._run_windows_elevated_with_capture(
+                "C:\\NVIDIA\\nvidia-smi.exe", ["-i", "0", "-pl", "200"], timeout=2
+            )
+
+        self.assertIsNone(exit_code)
+        self.assertEqual(output, "")
+        self.assertIn("not absolute", error or "")
+        elevate.assert_not_called()
 
     def test_set_power_limit_reports_captured_elevated_error(self) -> None:
         with (
