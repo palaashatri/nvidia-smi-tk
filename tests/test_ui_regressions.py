@@ -247,30 +247,38 @@ class UiStateRegressionTests(unittest.TestCase):
             app = GPUMonitorApp.__new__(GPUMonitorApp)
             app.root = root
             app.config = {"always_on_top": True}
-            root.attributes("-topmost", True)
             with patch("ui.app.save_config"):
-                app.setup_menu()
-                menubar = root.nametowidget(root.cget("menu"))
-                view_menu = root.nametowidget(menubar.entrycget("View", "menu"))
-                variable_name = view_menu.entrycget("Always on Top", "variable")
+                with patch.object(root, "attributes", wraps=root.attributes) as attrs:
+                    app.setup_menu()
+                    menubar = root.nametowidget(root.cget("menu"))
+                    view_menu = root.nametowidget(menubar.entrycget("View", "menu"))
+                    variable_name = view_menu.entrycget("Always on Top", "variable")
 
-                def checked() -> bool | None:
-                    try:
-                        return bool(int(root.getvar(variable_name)))
-                    except tk.TclError:
-                        return None
+                    def checked() -> bool | None:
+                        try:
+                            return bool(int(root.getvar(variable_name)))
+                        except tk.TclError:
+                            return None
 
-                observed = [checked()]
-                view_menu.invoke("Always on Top")
-                observed.append(checked())
-                observed.append(app.config["always_on_top"])
-                observed.append(bool(int(root.attributes("-topmost"))))
-                view_menu.invoke("Always on Top")
-                observed.append(checked())
-                observed.append(app.config["always_on_top"])
-                observed.append(bool(int(root.attributes("-topmost"))))
+                    checked_states = [checked()]
+                    config_states = []
+                    view_menu.invoke("Always on Top")
+                    checked_states.append(checked())
+                    config_states.append(app.config["always_on_top"])
+                    view_menu.invoke("Always on Top")
+                    checked_states.append(checked())
+                    config_states.append(app.config["always_on_top"])
+                    topmost_requests = [
+                        call.args
+                        for call in attrs.call_args_list
+                        if call.args[:1] == ("-topmost",) and len(call.args) == 2
+                    ]
 
-            self.assertEqual(observed, [True, False, False, False, True, True, True])
+            self.assertEqual(checked_states, [True, False, True])
+            self.assertEqual(config_states, [False, True])
+            self.assertEqual(
+                topmost_requests, [("-topmost", False), ("-topmost", True)]
+            )
         finally:
             root.destroy()
 

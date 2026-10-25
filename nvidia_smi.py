@@ -465,6 +465,17 @@ class _ShellExecuteInfo(ctypes.Structure):
     ]
 
 
+class _WindowsGuid(ctypes.Structure):
+    """Win32 GUID layout with fixed-width fields on every host platform."""
+
+    _fields_ = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
 def _set_win_api_signature(function: Any, argtypes: list[Any], restype: Any) -> None:
     """Assign Win32 prototypes when using real ctypes function pointers."""
     try:
@@ -607,15 +618,7 @@ def _get_windows_program_files_directory() -> str | None:
     if platform.system() != "Windows":
         return None
 
-    class _Guid(ctypes.Structure):
-        _fields_ = [
-            ("Data1", wintypes.DWORD),
-            ("Data2", wintypes.WORD),
-            ("Data3", wintypes.WORD),
-            ("Data4", ctypes.c_ubyte * 8),
-        ]
-
-    folder_id = _Guid.from_buffer_copy(
+    folder_id = _WindowsGuid.from_buffer_copy(
         uuid.UUID("905e63b6-c1bf-494e-b29c-65b732d3d21a").bytes_le
     )
     path_pointer = wintypes.LPWSTR()
@@ -624,7 +627,7 @@ def _get_windows_program_files_directory() -> str | None:
         _set_win_api_signature(
             shell32.SHGetKnownFolderPath,
             [
-                ctypes.POINTER(_Guid),
+                ctypes.POINTER(_WindowsGuid),
                 wintypes.DWORD,
                 wintypes.HANDLE,
                 ctypes.POINTER(wintypes.LPWSTR),

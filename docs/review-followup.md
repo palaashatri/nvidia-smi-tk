@@ -30,9 +30,9 @@ RTX 3080, driver 621.01:
   skipped on Windows.
 - unittest with the separate stdlib-only interpreter: 85 tests discovered,
   OK with the same one skip.
-- Latest pytest run: 99 passed, two skipped (the X11-only test and a real-Tk
-  test whose display initialization was unavailable on that run). The preceding
-  integrated pytest run passed 100 with only the X11 test skipped.
+- Latest pytest run: 100 passed, one X11-only test skipped on Windows. An
+  intermediate run also skipped a real-Tk test whose display initialization
+  was unavailable on that run; the final run exercised it successfully.
 - Ruff lint and formatting passed; compileall passed; pip check found no
   broken requirements; the Windows PyInstaller executable rebuilt successfully.
 - A live read-only GPU/Tk probe verified manual refresh with a 60-second
@@ -46,6 +46,12 @@ RTX 3080, driver 621.01:
 
 The independent follow-up review found no blockers in the scoped changes.
 Linux X11 mapping behavior is additionally covered by the new Xvfb CI test.
+The first display-enabled Linux CI run passed the new grab and process-row
+tests and exposed two platform assumptions: host-sized ctypes fields made a
+mocked Win32 GUID too large on LP64, and an older topmost regression expected
+a window manager in bare Xvfb. The follow-up uses an explicit 16-byte Windows
+GUID and verifies topmost requests plus actual menu/config state without
+requiring a window manager.
 Privileged commands remain mocked: no real power limit was changed. Live UAC,
 polkit authentication and real multi-GPU hardware remain outside this evidence.
 Review replies distinguish new fixes from the duplicate fixture findings that

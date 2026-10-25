@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import json
 import re
 import subprocess
@@ -207,6 +208,9 @@ class PowerLimitRegressionTests(unittest.TestCase):
                 return len(system_directory)
 
         class Shell32:
+            def __init__(self) -> None:
+                self.known_folder_guid_bytes: bytes | None = None
+
             def SHGetKnownFolderPath(
                 self,
                 _folder_id: object,
@@ -214,6 +218,7 @@ class PowerLimitRegressionTests(unittest.TestCase):
                 _token: object,
                 path_pointer: object,
             ) -> int:
+                self.known_folder_guid_bytes = ctypes.string_at(_folder_id, 16)
                 path_pointer._obj.value = program_files_directory
                 return 0
 
@@ -260,12 +265,13 @@ class PowerLimitRegressionTests(unittest.TestCase):
         self,
     ) -> None:
         trusted = r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+        path_apis = self._windows_path_apis(r"C:\Windows\System32", r"C:\Program Files")
         with (
             patch.object(nvidia_smi.platform, "system", return_value="Windows"),
             patch.object(
                 nvidia_smi.ctypes,
                 "windll",
-                self._windows_path_apis(r"C:\Windows\System32", r"C:\Program Files"),
+                path_apis,
                 create=True,
             ),
             patch.object(
@@ -293,6 +299,14 @@ class PowerLimitRegressionTests(unittest.TestCase):
         self.assertTrue(ok, _message)
         self.assertEqual(run.call_args.args[0][0], trusted)
         which.assert_not_called()
+        guid_type = getattr(nvidia_smi, "_WindowsGuid", None)
+        self.assertIsNotNone(guid_type, "Windows GUID layout should be explicit")
+        if guid_type is not None:
+            self.assertEqual(ctypes.sizeof(guid_type), 16)
+        self.assertEqual(
+            path_apis.shell32.known_folder_guid_bytes,
+            bytes.fromhex("b6635e90bfc14e49b29c65b732d3d21a"),
+        )
 
     def test_windows_power_set_rejects_path_when_no_trusted_executable_exists(
         self,
