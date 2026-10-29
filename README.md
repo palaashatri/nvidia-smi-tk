@@ -1,5 +1,10 @@
 # NVIDIA-SMI GUI Monitor
 
+<img src="assets/brand/app-icon.svg" alt="GPU Monitor icon" width="96" align="right" />
+
+[Icon, wordmark, and brand assets](assets/brand/README.md)
+
+
 A real-time graphical interface for monitoring NVIDIA GPU status using `nvidia-smi`, with color-coded metrics, multi-GPU support, process table filtering, and power limit adjustment.
 
 ![Multi-GPU Dark Mode](docs/screenshots/multi_gpu_overview.png)

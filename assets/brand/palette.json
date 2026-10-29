@@ -1,0 +1,13 @@
+{
+  "name": "GPU Monitor",
+  "category": "NVIDIA GPU telemetry",
+  "background": [
+    "#364e49",
+    "#1c302c"
+  ],
+  "accent": "#a3c2a4",
+  "highlight": "#e5eee1",
+  "typography": "Inter, Segoe UI, Arial",
+  "style": "muted-metal / enamel / soft-depth",
+  "license": "original project artwork"
+}
