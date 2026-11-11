@@ -1,4 +1,4 @@
 # Development and packaging tools; runtime optional features are in requirements.txt.
-pytest==8.4.2
+pytest==9.0.3
 ruff==0.14.2
 pyinstaller==6.16.0
